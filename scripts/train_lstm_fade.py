@@ -6,7 +6,8 @@ import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.linear_model import LinearRegression
+from torch.utils.tensorboard import SummaryWriter
+from sklearn.model_selection import train_test_split
 
 class BetDataset(Dataset):
     def __init__(self, data):
@@ -52,12 +53,19 @@ if __name__ == "__main__":
     # Preprocess
     df = df.sort_values(['Account', 'Date'])
     df = df[df['W/L'].isin(['W', 'L'])]
-    # Clean numerical columns before target calculation
+    # Expanded numerical_cols with more raw fields
     numerical_cols = ['Decimal Odds', 'Units Risked', 'Marketed Unit', 'Unit Size', 'Wager', 'Return %', 'Net $',
-                      'Account Net to Date', 'Account Average Return % to Date', 'Bet Number']
+                      'Account Net to Date', 'Account Average Return % to Date', 'Bet Number', 'Spread', 'Total',
+                      'Odds', 'Paid $', 'Account Net to Date for Month', 'Marked Unit Qualified',
+                      'Spread Bracker Qualified', 'Sport Qualified', 'League Qualified', 'Marketing Qualified',
+                      'Type Qualified', 'Spread Type Qualified', 'Total Type Qualified', 'ML Type Qualified',
+                      'Date Qualified', 'Count Towards Account Net', 'Last Wager in Month']
+    # Robust cleaning
     for col in numerical_cols:
-        if df[col].dtype == 'object':
-            df[col] = df[col].str.replace(',', '').str.replace('$', '').str.replace('%', '').astype(float)
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', '').str.replace('$', '').str.replace('%', ''),
+                                    errors='coerce')
+    df[numerical_cols] = df[numerical_cols].fillna(0)
     df['Target'] = np.where(df['W/L'] == 'L', df['Decimal Odds'] - 1, -1)
     # Add engineered features
     df['Win'] = (df['W/L'] == 'W').astype(float)
@@ -65,32 +73,95 @@ if __name__ == "__main__":
         lambda x: x.rolling(5, min_periods=1).mean().shift(1))
     df['Rolling_Win_Pct_10'] = df.groupby('Account')['Win'].transform(
         lambda x: x.rolling(10, min_periods=1).mean().shift(1))
+    # Additional rolling win pct
+    df['Rolling_Win_Pct_3'] = df.groupby('Account')['Win'].transform(
+        lambda x: x.rolling(3, min_periods=1).mean().shift(1))
+    df['Rolling_Win_Pct_15'] = df.groupby('Account')['Win'].transform(
+        lambda x: x.rolling(15, min_periods=1).mean().shift(1))
+    df['Rolling_Win_Pct_30'] = df.groupby('Account')['Win'].transform(
+        lambda x: x.rolling(30, min_periods=1).mean().shift(1))
+    df['Rolling_Win_Pct_50'] = df.groupby('Account')['Win'].transform(
+        lambda x: x.rolling(50, min_periods=1).mean().shift(1))
     df['Rolling_Return_5'] = df.groupby('Account')['Return %'].transform(
         lambda x: x.rolling(5, min_periods=1).mean().shift(1))
     df['Rolling_Return_10'] = df.groupby('Account')['Return %'].transform(
         lambda x: x.rolling(10, min_periods=1).mean().shift(1))
-    # Fill NaN in rolling features
-    rolling_cols = ['Rolling_Win_Pct_5', 'Rolling_Win_Pct_10', 'Rolling_Return_5', 'Rolling_Return_10']
-    df[rolling_cols] = df[rolling_cols].fillna(0)
 
+    # Additional rolling returns
+    df['Rolling_Return_3'] = df.groupby('Account')['Return %'].transform(
+        lambda x: x.rolling(3, min_periods=1).mean().shift(1))
+    df['Rolling_Return_15'] = df.groupby('Account')['Return %'].transform(
+        lambda x: x.rolling(15, min_periods=1).mean().shift(1))
+    df['Rolling_Return_30'] = df.groupby('Account')['Return %'].transform(
+        lambda x: x.rolling(30, min_periods=1).mean().shift(1))
+    df['Rolling_Return_50'] = df.groupby('Account')['Return %'].transform(
+        lambda x: x.rolling(50, min_periods=1).mean().shift(1))
 
-    # Trendline deviation
-    def calc_trend_dev(group):
-        if len(group) < 2:
-            group['Trend_Dev'] = 0
-            return group
-        x = group['Bet Number'].values.reshape(-1, 1)
-        y = group['Account Net to Date'].values
-        reg = LinearRegression().fit(x, y)
-        pred = reg.predict(x)
-        group['Trend_Dev'] = y - pred
-        return group
+    # Rolling net sums
+    df['Rolling_Net_5'] = df.groupby('Account')['Net $'].transform(
+        lambda x: x.rolling(5, min_periods=1).sum().shift(1))
+    df['Rolling_Net_10'] = df.groupby('Account')['Net $'].transform(
+        lambda x: x.rolling(10, min_periods=1).sum().shift(1))
+    df['Rolling_Net_20'] = df.groupby('Account')['Net $'].transform(
+        lambda x: x.rolling(20, min_periods=1).sum().shift(1))
+    df['Rolling_Net_30'] = df.groupby('Account')['Net $'].transform(
+        lambda x: x.rolling(30, min_periods=1).sum().shift(1))
 
+    # Rolling odds means
+    df['Rolling_Odds_5'] = df.groupby('Account')['Decimal Odds'].transform(
+        lambda x: x.rolling(5, min_periods=1).mean().shift(1))
+    df['Rolling_Odds_10'] = df.groupby('Account')['Decimal Odds'].transform(
+        lambda x: x.rolling(10, min_periods=1).mean().shift(1))
 
-    df = df.groupby('Account').apply(calc_trend_dev).reset_index(drop=True)
-    # Add new features to numerical_cols
-    numerical_cols += rolling_cols + ['Trend_Dev']
-    categorical_cols = ['Type', 'Sport', 'League', 'Marketing', 'Spread Type', 'Total Type', 'ML Type', 'Odds Bracket', 'Wager Bracket']
+    # Rolling return std
+    df['Rolling_Return_Std_5'] = df.groupby('Account')['Return %'].transform(
+        lambda x: x.rolling(5, min_periods=1).std().shift(1))
+    df['Rolling_Return_Std_10'] = df.groupby('Account')['Return %'].transform(
+        lambda x: x.rolling(10, min_periods=1).std().shift(1))
+
+    # EWM
+    df['EWM_Win_Pct'] = df.groupby('Account')['Win'].apply(lambda x: x.ewm(span=10, adjust=False).mean()).groupby(
+        level=0).shift(1).droplevel(0)
+    df['EWM_Return'] = df.groupby('Account')['Return %'].apply(lambda x: x.ewm(span=10, adjust=False).mean()).groupby(level=0).shift(1).droplevel(0)
+
+    # Lags
+    df['Lag1_Return'] = df.groupby('Account')['Return %'].shift(1)
+    df['Lag1_Net'] = df.groupby('Account')['Net $'].shift(1)
+
+    # Streak
+    df['streak_group'] = (df.groupby('Account')['Win'].diff() != 0).cumsum()
+    df['Streak'] = df.groupby(['Account', 'streak_group']).cumcount() + 1
+    df['Streak'] = np.where(df['Win'] == 0, -df['Streak'], df['Streak'])
+    df = df.drop('streak_group', axis=1)
+
+    # Days since last
+    df['Days_Since_Last'] = df.groupby('Account')['Date'].diff().dt.days
+
+    # Rolling days between
+    df['Rolling_Days_Between_5'] = df.groupby('Account')['Days_Since_Last'].transform(
+        lambda x: x.rolling(5, min_periods=1).mean().shift(1))
+
+    # Time features
+    df['Day_of_Week'] = df['Date'].dt.dayofweek
+    df['Is_Weekend'] = (df['Day_of_Week'] >= 5).astype(int)
+    df['Month'] = df['Date'].dt.month
+
+    # Logs
+    df['Bet_Number_Log'] = np.log1p(df['Bet Number'])
+    df['Wager_Log'] = np.log1p(df['Wager'])
+    # Fill NaNs for new features
+    new_cols = ['Rolling_Win_Pct_3', 'Rolling_Win_Pct_15', 'Rolling_Win_Pct_30', 'Rolling_Win_Pct_50',
+                'Rolling_Return_3', 'Rolling_Return_15', 'Rolling_Return_30', 'Rolling_Return_50',
+                'Rolling_Net_5', 'Rolling_Net_10', 'Rolling_Net_20', 'Rolling_Net_30',
+                'Rolling_Odds_5', 'Rolling_Odds_10', 'Rolling_Return_Std_5', 'Rolling_Return_Std_10',
+                'EWM_Win_Pct', 'EWM_Return', 'Lag1_Return', 'Lag1_Net', 'Streak', 'Days_Since_Last',
+                'Rolling_Days_Between_5', 'Day_of_Week', 'Is_Weekend', 'Month', 'Bet_Number_Log', 'Wager_Log']
+    df[new_cols] = df[new_cols].fillna(0)
+    # Add to numerical_cols
+    numerical_cols += new_cols
+    # Expanded categorical
+    categorical_cols = ['Type', 'Sport', 'League', 'Marketing', 'Spread Type', 'Total Type', 'ML Type',
+                        'Odds Bracket', 'Wager Bracket', 'Team', 'Division']
 
     encoders = {col: LabelEncoder().fit(df[col].astype(str)) for col in categorical_cols}
     for col in categorical_cols:
@@ -101,32 +172,45 @@ if __name__ == "__main__":
 
     # Build sequences per account
     sequence_length = 10
+    step = 1  # User-configurable step for sequence overlap (1=max overlap, sequence_length=no overlap)
     features = categorical_cols + numerical_cols
     data = []
     groups = df.groupby('Account')
     for name, group in groups:
         group['Days'] = (group['Date'] - group['Date'].min()).dt.days
-        for i in range(len(group) - sequence_length):
+        for i in range(0, len(group) - sequence_length + 1, step):
             seq = group.iloc[i:i+sequence_length][features + ['Days']].values
             label = group.iloc[i+sequence_length]['Target']
             data.append((seq, label))
 
     # Dataset
-    dataset = BetDataset(data)
-    loader = DataLoader(dataset, batch_size=32, shuffle=True)
+    train_data, val_data = train_test_split(data, test_size=0.2, random_state=42)
+    train_dataset = BetDataset(train_data)
+    val_dataset = BetDataset(val_data)
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
 
     # Model
     input_size = len(features) + 1  # + Days
+    hidden_size = 64
+    num_layers = 2
+    lr = 0.001
+    max_epochs = 10
+    patience = 3
     model = LSTMModel(input_size, 64, 2)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
-    # Train
-    for epoch in range(10):
+    writer = SummaryWriter()
+    min_val_loss = float('inf')
+    counter = 0
+    best_model_state = None
+    for epoch in range(max_epochs):
         model.train()
-        for seqs, labels in loader:
+        train_loss = 0.0
+        for seqs, labels in train_loader:
             seqs = seqs.to(device)
             labels = labels.to(device)
             optimizer.zero_grad()
@@ -134,7 +218,33 @@ if __name__ == "__main__":
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
-        print(f'Epoch {epoch+1}, Loss: {loss.item():.4f}')
+            train_loss += loss.item() * seqs.size(0)
+        train_loss /= len(train_loader.dataset)
+        writer.add_scalar('Loss/train', train_loss, epoch)
 
-    # Save model
-    torch.save(model.state_dict(), 'output/models/fade_model.pth')
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for seqs, labels in val_loader:
+                seqs = seqs.to(device)
+                labels = labels.to(device)
+                outputs = model(seqs).squeeze()
+                loss = criterion(outputs, labels)
+                val_loss += loss.item() * seqs.size(0)
+        val_loss /= len(val_loader.dataset)
+        writer.add_scalar('Loss/val', val_loss, epoch)
+        print(f'Epoch {epoch + 1}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
+
+        if val_loss < min_val_loss:
+            min_val_loss = val_loss
+            counter = 0
+            best_model_state = model.state_dict().copy()
+        else:
+            counter += 1
+            if counter >= patience:
+                print(f'Early stopping at epoch {epoch + 1}')
+                break
+    writer.close()
+    # Save best model
+    filename = f'output/models/fade_model_seq{sequence_length}_bs{32}_hs{hidden_size}_nl{num_layers}_lr{lr}_ep{max_epochs}_pat{patience}.pth'
+    torch.save(best_model_state, filename)
