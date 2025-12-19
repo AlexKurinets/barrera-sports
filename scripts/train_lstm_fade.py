@@ -34,6 +34,28 @@ class LSTMModel(nn.Module):
 
 if __name__ == "__main__":
     print("Training LSTM model...")
+    config = {
+        'sequence_length': 10,
+        'batch_size': 32,
+        'hidden_size': 64,
+        'num_layers': 2,
+        'l1_regularization': 0.0,
+        'l2_regularization': 0.0,
+        'steps_ahead': 5,
+        'learning_rate': 0.001,
+        'patience': 3,
+        'max_epochs': 10
+    }
+    sequence_length = config['sequence_length']
+    batch_size = config['batch_size']
+    hidden_size = config['hidden_size']
+    num_layers = config['num_layers']
+    l1_reg = config['l1_regularization']
+    l2_reg = config['l2_regularization']
+    steps_ahead = config['steps_ahead']
+    lr = config['learning_rate']
+    patience = config['patience']
+    max_epochs = config['max_epochs']
     # Get secrets
     secrets_client = boto3.client('secretsmanager', region_name='us-east-2')
     secret_name = 'secrets_key'
@@ -60,6 +82,7 @@ if __name__ == "__main__":
                       'Spread Bracker Qualified', 'Sport Qualified', 'League Qualified', 'Marketing Qualified',
                       'Type Qualified', 'Spread Type Qualified', 'Total Type Qualified', 'ML Type Qualified',
                       'Date Qualified', 'Count Towards Account Net', 'Last Wager in Month']
+    numerical_cols = [col for col in numerical_cols if col in df.columns]
     # Robust cleaning
     for col in numerical_cols:
         if col in df.columns:
@@ -162,7 +185,7 @@ if __name__ == "__main__":
     # Expanded categorical
     categorical_cols = ['Type', 'Sport', 'League', 'Marketing', 'Spread Type', 'Total Type', 'ML Type',
                         'Odds Bracket', 'Wager Bracket', 'Team', 'Division']
-
+    categorical_cols = [col for col in categorical_cols if col in df.columns]
     encoders = {col: LabelEncoder().fit(df[col].astype(str)) for col in categorical_cols}
     for col in categorical_cols:
         df[col] = encoders[col].transform(df[col].astype(str))
@@ -171,14 +194,12 @@ if __name__ == "__main__":
     df[numerical_cols] = scaler.transform(df[numerical_cols])
 
     # Build sequences per account
-    sequence_length = 10
-    step = 1  # User-configurable step for sequence overlap (1=max overlap, sequence_length=no overlap)
     features = categorical_cols + numerical_cols
     data = []
     groups = df.groupby('Account')
     for name, group in groups:
         group['Days'] = (group['Date'] - group['Date'].min()).dt.days
-        for i in range(0, len(group) - sequence_length + 1, step):
+        for i in range(0, len(group) - sequence_length, steps_ahead):
             seq = group.iloc[i:i+sequence_length][features + ['Days']].values
             label = group.iloc[i+sequence_length]['Target']
             data.append((seq, label))
@@ -192,16 +213,11 @@ if __name__ == "__main__":
 
     # Model
     input_size = len(features) + 1  # + Days
-    hidden_size = 64
-    num_layers = 2
-    lr = 0.001
-    max_epochs = 10
-    patience = 3
     model = LSTMModel(input_size, 64, 2)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=l2_reg)
 
     writer = SummaryWriter()
     min_val_loss = float('inf')
@@ -216,6 +232,9 @@ if __name__ == "__main__":
             optimizer.zero_grad()
             outputs = model(seqs).squeeze()
             loss = criterion(outputs, labels)
+            if l1_reg > 0:
+                l1_penalty = sum(p.abs().sum() for p in model.parameters())
+                loss += l1_reg * l1_penalty
             loss.backward()
             optimizer.step()
             train_loss += loss.item() * seqs.size(0)
@@ -246,5 +265,5 @@ if __name__ == "__main__":
                 break
     writer.close()
     # Save best model
-    filename = f'output/models/fade_model_seq{sequence_length}_bs{32}_hs{hidden_size}_nl{num_layers}_lr{lr}_ep{max_epochs}_pat{patience}.pth'
+    filename = f'output/models/fade_model_seq{sequence_length}_bs{batch_size}_hs{hidden_size}_nl{num_layers}_lr{lr}_ep{max_epochs}_pat{patience}.pth'
     torch.save(best_model_state, filename)
