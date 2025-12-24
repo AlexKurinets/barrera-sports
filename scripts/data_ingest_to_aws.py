@@ -21,7 +21,7 @@ export_url = f'https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=c
 response = requests.get(export_url)
 csv_content = response.content.decode('utf-8')
 df_new = pd.read_csv(StringIO(csv_content))
-df_new['Date'] = pd.to_datetime(df_new['Date'], format='%m/%d/%Y')
+df_new['Date'] = pd.to_datetime(df_new['Date']).dt.strftime("%Y-%m-%d")
 
 # S3 setup
 s3 = boto3.client('s3', aws_access_key_id=aws_access_key, aws_secret_access_key=aws_secret_key)
