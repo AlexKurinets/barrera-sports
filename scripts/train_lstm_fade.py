@@ -42,7 +42,7 @@ if __name__ == "__main__":
         'num_layers': 2,
         'l1_regularization': 0.001,
         'l2_regularization': 0.001,
-        'steps_ahead': 5,
+        'steps_ahead': 1,
         'learning_rate': 0.001,
         'patience': 10,
         'max_epochs': 40,
