@@ -10,17 +10,16 @@ from torch.utils.tensorboard import SummaryWriter
 from sklearn.model_selection import train_test_split
 import random
 import os
-import io
-import joblib
 
 class BetDataset(Dataset):
     def __init__(self, data):
-        self.data = data # now list of (seq, label, account)
+        self.data = data  # now list of (seq, label, account)
     def __len__(self):
         return len(self.data)
     def __getitem__(self, idx):
         seq, label, account = self.data[idx]
         return torch.tensor(seq, dtype=torch.float32), torch.tensor(label, dtype=torch.float32), account
+
 class LSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers):
         super().__init__()
@@ -31,7 +30,7 @@ class LSTMModel(nn.Module):
         out = self.fc(h[-1])
         return out
 
-def train_batch(end_date, config, df, s3, s3_bucket):
+def train_batch(end_date, config, df):
     print(f"Training LSTM model for end_date {end_date}...")
     seed = 42
     random.seed(seed)
@@ -137,7 +136,7 @@ def train_batch(end_date, config, df, s3, s3_bucket):
     # Rolling days between
     df_batch['Rolling_Days_Between_5'] = df_batch.groupby('Account')['Days_Since_Last'].transform(
         lambda x: x.rolling(5, min_periods=1).mean().shift(1))
-    # # Time features
+    # Time features
     df_batch['Day_of_Week'] = df_batch['Date'].dt.dayofweek
     df_batch['Is_Weekend'] = (df_batch['Day_of_Week'] >= 5).astype(int)
     df_batch['Month'] = df_batch['Date'].dt.month
@@ -150,22 +149,8 @@ def train_batch(end_date, config, df, s3, s3_bucket):
                 'Rolling_Net_5', 'Rolling_Net_10', 'Rolling_Net_20', 'Rolling_Net_30',
                 'Rolling_Odds_5', 'Rolling_Odds_10', 'Rolling_Return_Std_5', 'Rolling_Return_Std_10',
                 'EWM_Win_Pct', 'EWM_Return', 'Lag1_Return', 'Lag1_Net', 'Streak', 'Days_Since_Last',
-                'Rolling_Days_Between_5',
-                'Day_of_Week', 'Is_Weekend', 'Month',
-                'Bet_Number_Log', 'Wager_Log'
-                ]
+                'Rolling_Days_Between_5', 'Day_of_Week', 'Is_Weekend', 'Month', 'Bet_Number_Log', 'Wager_Log']
     df_batch[new_cols] = df_batch[new_cols].fillna(0)
-    end_date_str = end_date.strftime('%Y%m%d')
-    hyperparams_str = (f"seq_{sequence_length}"
-                       f"_bs_{batch_size}"
-                       f"_hs_{hidden_size}"
-                       f"_nl_{num_layers}"
-                       f"_l1_{l1_reg}"
-                       f"_l2_{l2_reg}"
-                       f"_sa_{steps_ahead}"
-                       f"_lr_{lr}"
-                       f"_pat_{patience}"
-                       f"_ep_{max_epochs}")
     # Add to numerical_cols
     numerical_cols += new_cols
     # Expanded categorical
@@ -177,16 +162,6 @@ def train_batch(end_date, config, df, s3, s3_bucket):
         df_batch[col] = encoders[col].transform(df_batch[col].astype(str))
     scaler = StandardScaler().fit(df_batch[numerical_cols])
     df_batch[numerical_cols] = scaler.transform(df_batch[numerical_cols])
-    preprocessors = {'scaler': scaler, 'encoders': encoders}
-    joblib_filename = f'output/models/preprocessors_{hyperparams_str}_end_{end_date_str}.joblib'
-    os.makedirs(os.path.dirname(joblib_filename), exist_ok=True)
-    joblib.dump(preprocessors, joblib_filename)
-    s3_key_joblib = 'models/' + os.path.basename(joblib_filename)
-    with io.BytesIO() as buffer:
-        joblib.dump(preprocessors, buffer)
-        buffer.seek(0)
-        s3.upload_fileobj(buffer, s3_bucket, s3_key_joblib)
-
     # Build sequences per account
     features = categorical_cols + numerical_cols
     data = []
@@ -196,7 +171,7 @@ def train_batch(end_date, config, df, s3, s3_bucket):
         for i in range(0, len(group) - sequence_length, steps_ahead):
             seq = group.iloc[i:i+sequence_length][features + ['Days']].values
             label = group.iloc[i+sequence_length]['Target']
-            data.append((seq, label, name)) # add account name
+            data.append((seq, label, name))  # add account name
     # Dataset
     train_data, val_data = train_test_split(data, test_size=0.2, random_state=42)
     train_dataset = BetDataset(train_data)
@@ -204,13 +179,24 @@ def train_batch(end_date, config, df, s3, s3_bucket):
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
     # Model
-    input_size = len(features) + 1 # + Days
+    input_size = len(features) + 1  # + Days
     model = LSTMModel(input_size, 64, 2)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=l2_reg)
-    log_dir = f"output/tensorboard/runs/{hyperparams_str}/{hyperparams_str}_end_{end_date_str}"
+    end_date_str = end_date.strftime('%Y%m%d')
+    hyperparams_str = (f"seq*{sequence_length}"
+                       f"*bs*{batch_size}"
+                       f"*hs*{hidden_size}"
+                       f"*nl*{num_layers}"
+                       f"*l1*{l1_reg}"
+                       f"*l2*{l2_reg}"
+                       f"*sa*{steps_ahead}"
+                       f"*lr*{lr}"
+                       f"*pat*{patience}"
+                       f"*ep*{max_epochs}")
+    log_dir = f"output/tensorboard/runs/{hyperparams_str}/{hyperparams_str}*end*{end_date_str}"
     os.makedirs(log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=log_dir)
     min_val_loss = float('inf')
@@ -258,7 +244,7 @@ def train_batch(end_date, config, df, s3, s3_bucket):
         for acc in account_losses:
             if account_counts[acc] > 0:
                 acc_val_loss = account_losses[acc] / account_counts[acc]
-                writer.add_scalar(f'Loss/val_account_{acc}', acc_val_loss, epoch)
+                writer.add_scalar(f'Loss/val_account*{acc}', acc_val_loss, epoch)
         print(f'Epoch {epoch + 1}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f} for end_date {end_date}')
         if val_loss < min_val_loss:
             min_val_loss = val_loss
@@ -272,20 +258,15 @@ def train_batch(end_date, config, df, s3, s3_bucket):
     writer.close()
     # Save best model
     filename = (f'output/models/'
-                f'fade_model_seq_{sequence_length}_'
-                f'bs_{batch_size}_'
-                f'hs_{hidden_size}_'
-                f'nl_{num_layers}_'
-                f'lr_{lr}_'
-                f'ep_{max_epochs}_'
-                f'pat_{patience}_'
-                f'end_{end_date_str}.pth')
+                f'fade_model_seq_{sequence_length}*'
+                f'bs*{batch_size}*'
+                f'hs*{hidden_size}*'
+                f'nl*{num_layers}*'
+                f'lr*{lr}*'
+                f'ep*{max_epochs}*'
+                f'pat*{patience}*'
+                f'end*{end_date_str}.pth')
     torch.save(best_model_state, filename)
-    s3_key_model = 'models/' + os.path.basename(filename)
-    with io.BytesIO() as buffer:
-        torch.save(best_model_state, buffer)
-        buffer.seek(0)
-        s3.upload_fileobj(buffer, s3_bucket, s3_key_model)
 
 if __name__ == "__main__":
     config = {
@@ -295,10 +276,10 @@ if __name__ == "__main__":
         'num_layers': 2,
         'l1_regularization': 0,
         'l2_regularization': 0,
-        'steps_ahead': 5,
-        'learning_rate': 0.01,
-        'patience': 10,
-        'max_epochs': 40,
+        'steps_ahead': 1,
+        'learning_rate': 0.001,
+        'patience': 3,
+        'max_epochs': 10,
         'min_rows_batch': 300
     }
     # Get secrets
@@ -314,11 +295,11 @@ if __name__ == "__main__":
     s3_key = 'bet_data/bet_data.csv'
     obj = s3.get_object(Bucket=s3_bucket, Key=s3_key)
     df = pd.read_csv(obj['Body'], encoding='latin1')
-    df["Date"] = pd.to_datetime(df["Date"], format = "%Y-%m-%d")
+    df['Date'] = pd.to_datetime(df['Date'])
     cum_rows = df.groupby('Date').size().sort_index().cumsum()
     unique_dates = cum_rows.index.tolist()
     min_rows_batch = config['min_rows_batch']
     end_dates = [d for d in unique_dates if cum_rows[d] >= min_rows_batch]
     # Sequential processing
-    for end_date in end_dates[-1:]: # Use only the last end_date for single model
-        train_batch(end_date, config, df, s3, s3_bucket)
+    for end_date in end_dates[-1:]:  # Use only the last end_date for single model
+        train_batch(end_date, config, df)
