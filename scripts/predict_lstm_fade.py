@@ -8,6 +8,7 @@ import os
 import io
 import joblib
 import re
+import requests
 
 class LSTMModel(nn.Module):
     def __init__(self, input_size_num, cat_cols, vocab_sizes, embed_dim, hidden_size, num_layers):
@@ -121,6 +122,8 @@ if __name__ == "__main__":
     aws_access_key = secrets['aws_access_key_id']
     aws_secret_key = secrets['aws_secret_access_key']
     s3_bucket = secrets['bucket_name']
+    telegram_bot_token = secrets['telegram_bot_token']
+    telegram_chat_id = secrets['telegram_chat_id']
     s3 = boto3.client('s3', aws_access_key_id=aws_access_key, aws_secret_access_key=aws_secret_key)
     s3_key = 'bet_data/bet_data.csv'
     obj = s3.get_object(Bucket=s3_bucket, Key=s3_key)
@@ -159,7 +162,7 @@ if __name__ == "__main__":
     sequence_length, _, hidden_size, num_layers, _, _, _ = parse_hyperparams(
         filename)
     df, numerical_cols, categorical_cols, untransformed_df = preprocess_df(df, encoders, scaler)
-    vocab_sizes = {col: int(df[col].max()) + 1 for col in categorical_cols}
+    vocab_sizes = {col: len(encoders[col].classes_) + 1 for col in categorical_cols}
     embed_dim = 16
     input_size_num = len(numerical_cols)
     model = LSTMModel(input_size_num, categorical_cols, vocab_sizes, embed_dim, hidden_size, num_layers)
@@ -201,3 +204,10 @@ if __name__ == "__main__":
     csv_buffer = io.StringIO()
     pred_df.to_csv(csv_buffer, index=False)
     s3.put_object(Bucket=s3_bucket, Key=f'predictions/pred_{most_recent_str}.csv', Body=csv_buffer.getvalue())
+    csv_buffer.seek(0)
+    url = f"https://api.telegram.org/bot{telegram_bot_token}/sendDocument"
+    files = {'document': (f'pred_{most_recent_str}.csv', csv_buffer.getvalue().encode('utf-8'))}
+    data = {'chat_id': telegram_chat_id, 'caption': 'Predicted bets'}
+    response = requests.post(url, data=data, files=files)
+    if response.status_code != 200:
+        print(f"Failed to send Telegram message: {response.text}")
