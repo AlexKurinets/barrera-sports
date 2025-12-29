@@ -12,6 +12,7 @@ import random
 import os
 import io
 import joblib
+import torch.nn.functional as F  # Added for binary_cross_entropy_with_logits
 
 class BetDataset(Dataset):
     def __init__(self, data):
@@ -19,14 +20,22 @@ class BetDataset(Dataset):
     def __len__(self):
         return len(self.data)
     def __getitem__(self, idx):
-        seq, label, account = self.data[idx]
-        return torch.tensor(seq, dtype=torch.float32), torch.tensor(label, dtype=torch.float32), account
-class LSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers):
+        seq_num, seq_cat, label, account = self.data[idx]  # Updated BetDataset getitem to return seq_num, seq_cat
+        return torch.tensor(seq_num, dtype=torch.float32), torch.tensor(seq_cat, dtype=torch.long), torch.tensor(label,
+                                                                                                                 dtype=torch.float32), account
+
+class LSTMModel(nn.Module):  # Updated LSTMModel to include embeddings for categorical features, added dropout=0.2 to LSTM
+    def __init__(self, input_size_num, cat_cols, vocab_sizes, embed_dim, hidden_size, num_layers):
         super().__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.cat_cols = cat_cols
+        self.embeddings = nn.ModuleDict({col: nn.Embedding(vocab_sizes[col], embed_dim) for col in cat_cols})
+        embed_size = len(cat_cols) * embed_dim
+        self.lstm = nn.LSTM(input_size_num + embed_size, hidden_size, num_layers, batch_first=True, dropout=0.2)
         self.fc = nn.Linear(hidden_size, 1)
-    def forward(self, x):
+    def forward(self, x_num, x_cat):
+        embeds = [self.embeddings[col](x_cat[:,:,i]) for i, col in enumerate(self.cat_cols)]
+        embeds = torch.cat(embeds, dim=-1)
+        x = torch.cat([x_num, embeds], dim=-1)
         _, (h, _) = self.lstm(x)
         out = self.fc(h[-1])
         return out
@@ -72,7 +81,8 @@ def train_batch(end_date, config, df, s3, s3_bucket):
             df_batch[col] = pd.to_numeric(df_batch[col].astype(str).str.replace(',', '').str.replace('$', '').str.replace('%', ''),
                                           errors='coerce')
     df_batch[numerical_cols] = df_batch[numerical_cols].fillna(0)
-    df_batch['Target'] = np.where(df_batch['W/L'] == 'L', df_batch['Decimal Odds'] - 1, -1)
+    df_batch['Target'] = (df_batch['W/L'] == 'W').astype(float)  # Changed to binary: 1 for W, 0 for L
+    print(f"Win rate for {end_date}: {df_batch['Target'].mean():.4f}")  # Added print win rate to check balance
     # Add engineered features
     df_batch['Win'] = (df_batch['W/L'] == 'W').astype(float)
     df_batch['Rolling_Win_Pct_5'] = df_batch.groupby('Account')['Win'].transform(
@@ -144,9 +154,12 @@ def train_batch(end_date, config, df, s3, s3_bucket):
     # Logs
     df_batch['Bet_Number_Log'] = np.log1p(df_batch['Bet Number'])
     df_batch['Wager_Log'] = np.log1p(df_batch['Wager'])
+    df_batch['Days'] = (df_batch['Date'] - df_batch.groupby('Account')['Date'].transform('min')).dt.days
     # Fill NaNs for new features
-    new_cols = ['Rolling_Win_Pct_3', 'Rolling_Win_Pct_15', 'Rolling_Win_Pct_30', 'Rolling_Win_Pct_50',
-                'Rolling_Return_3', 'Rolling_Return_15', 'Rolling_Return_30', 'Rolling_Return_50',
+    new_cols = ['Rolling_Win_Pct_5', 'Rolling_Win_Pct_10', 'Rolling_Win_Pct_3', 'Rolling_Win_Pct_15',
+                'Rolling_Win_Pct_30', 'Rolling_Win_Pct_50',
+                'Rolling_Return_5', 'Rolling_Return_10', 'Rolling_Return_3', 'Rolling_Return_15', 'Rolling_Return_30',
+                'Rolling_Return_50',
                 'Rolling_Net_5', 'Rolling_Net_10', 'Rolling_Net_20', 'Rolling_Net_30',
                 'Rolling_Odds_5', 'Rolling_Odds_10', 'Rolling_Return_Std_5', 'Rolling_Return_Std_10',
                 'EWM_Win_Pct', 'EWM_Return', 'Lag1_Return', 'Lag1_Net', 'Streak', 'Days_Since_Last',
@@ -154,6 +167,7 @@ def train_batch(end_date, config, df, s3, s3_bucket):
                 'Day_of_Week', 'Is_Weekend', 'Month',
                 'Bet_Number_Log', 'Wager_Log'
                 ]
+    new_cols.append('Days')
     df_batch[new_cols] = df_batch[new_cols].fillna(0)
     end_date_str = end_date.strftime('%Y%m%d')
     hyperparams_str = (f"seq_{sequence_length}"
@@ -188,15 +202,16 @@ def train_batch(end_date, config, df, s3, s3_bucket):
         s3.upload_fileobj(buffer, s3_bucket, s3_key_joblib)
 
     # Build sequences per account
-    features = categorical_cols + numerical_cols
+    num_features = numerical_cols  # In sequence building, separated seq_num and seq_cat
+    cat_features = categorical_cols
     data = []
     groups = df_batch.groupby('Account')
     for name, group in groups:
-        group['Days'] = (group['Date'] - group['Date'].min()).dt.days
         for i in range(0, len(group) - sequence_length, steps_ahead):
-            seq = group.iloc[i:i+sequence_length][features + ['Days']].values
-            label = group.iloc[i+sequence_length]['Target']
-            data.append((seq, label, name)) # add account name
+            seq_num = group.iloc[i:i + sequence_length][num_features].values
+            seq_cat = group.iloc[i:i + sequence_length][cat_features].values
+            label = group.iloc[i + sequence_length]['Target']
+            data.append((seq_num, seq_cat, label, name))
     # Dataset
     train_data, val_data = train_test_split(data, test_size=0.2, random_state=42)
     train_dataset = BetDataset(train_data)
@@ -204,11 +219,13 @@ def train_batch(end_date, config, df, s3, s3_bucket):
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
     # Model
-    input_size = len(features) + 1 # + Days
-    model = LSTMModel(input_size, 64, 2)
+    vocab_sizes = {col: len(encoders[col].classes_) + 1 for col in categorical_cols}
+    embed_dim = 16
+    input_size_num = len(num_features)
+    model = LSTMModel(input_size_num, categorical_cols, vocab_sizes, embed_dim, hidden_size, num_layers)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
-    criterion = nn.MSELoss()
+    criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=l2_reg)
     log_dir = f"output/tensorboard/runs/{hyperparams_str}/{hyperparams_str}_end_{end_date_str}"
     os.makedirs(log_dir, exist_ok=True)
@@ -219,18 +236,19 @@ def train_batch(end_date, config, df, s3, s3_bucket):
     for epoch in range(max_epochs):
         model.train()
         train_loss = 0.0
-        for seqs, labels, _ in train_loader:
-            seqs = seqs.to(device)
+        for seqs_num, seqs_cat, labels, _ in train_loader:  # In training and val loops, passed seqs_num, seqs_cat to model
+            seqs_num = seqs_num.to(device)
+            seqs_cat = seqs_cat.to(device)
             labels = labels.to(device)
             optimizer.zero_grad()
-            outputs = model(seqs).squeeze()
+            outputs = model(seqs_num, seqs_cat).squeeze()
             loss = criterion(outputs, labels)
             if l1_reg > 0:
                 l1_penalty = sum(p.abs().sum() for p in model.parameters())
                 loss += l1_reg * l1_penalty
             loss.backward()
             optimizer.step()
-            train_loss += loss.item() * seqs.size(0)
+            train_loss += loss.item() * seqs_num.size(0)
         train_loss /= len(train_loader.dataset)
         writer.add_scalar('Loss/train', train_loss, epoch)
         model.eval()
@@ -238,17 +256,19 @@ def train_batch(end_date, config, df, s3, s3_bucket):
         account_counts = {}
         total_val_loss = 0.0
         with torch.no_grad():
-            for seqs, labels, accounts in val_loader:
-                seqs = seqs.to(device)
+            for seqs_num, seqs_cat, labels, accounts in val_loader:
+                seqs_num = seqs_num.to(device)
+                seqs_cat = seqs_cat.to(device)
                 labels = labels.to(device)
-                outputs = model(seqs).squeeze()
+                outputs = model(seqs_num, seqs_cat).squeeze()
                 for out, lab, acc in zip(outputs, labels, accounts):
-                    sq_err = ((out - lab) ** 2).item()
-                    total_val_loss += sq_err
+                    loss_item = F.binary_cross_entropy_with_logits(out, lab,
+                                                                   reduction='sum').item()  # Changed from MSE to BCE
+                    total_val_loss += loss_item
                     if acc not in account_losses:
                         account_losses[acc] = 0.0
                         account_counts[acc] = 0
-                    account_losses[acc] += sq_err
+                    account_losses[acc] += loss_item
                     account_counts[acc] += 1
         if sum(account_counts.values()) > 0:
             val_loss = total_val_loss / sum(account_counts.values())
@@ -289,14 +309,14 @@ def train_batch(end_date, config, df, s3, s3_bucket):
 
 if __name__ == "__main__":
     config = {
-        'sequence_length': 10,
+        'sequence_length': 40,
         'batch_size': 32,
-        'hidden_size': 64,
+        'hidden_size': 32,
         'num_layers': 2,
         'l1_regularization': 0,
         'l2_regularization': 0,
-        'steps_ahead': 5,
-        'learning_rate': 0.01,
+        'steps_ahead': 10,
+        'learning_rate': 0.001,
         'patience': 10,
         'max_epochs': 40,
         'min_rows_batch': 300
