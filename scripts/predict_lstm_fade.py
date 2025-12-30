@@ -9,6 +9,8 @@ import io
 import joblib
 import re
 import requests
+import time
+from datetime import datetime, timezone
 
 class LSTMModel(nn.Module):
     def __init__(self, input_size_num, cat_cols, vocab_sizes, embed_dim, hidden_size, num_layers):
@@ -126,88 +128,103 @@ if __name__ == "__main__":
     telegram_chat_id = secrets['telegram_chat_id']
     s3 = boto3.client('s3', aws_access_key_id=aws_access_key, aws_secret_access_key=aws_secret_key)
     s3_key = 'bet_data/bet_data.csv'
-    obj = s3.get_object(Bucket=s3_bucket, Key=s3_key)
-    df = pd.read_csv(obj['Body'], encoding='latin1')
-    df["Date"] = pd.to_datetime(df["Date"], format = "%Y-%m-%d")
-    most_recent_date = df['Date'].max()
-    most_recent_str = most_recent_date.strftime('%Y%m%d')
-    response = s3.list_objects_v2(Bucket=s3_bucket, Prefix='models/')
-    files = [obj['Key'] for obj in response.get('Contents', []) if 'end_' in obj['Key']]
-    dates = set()
-    for f in files:
-        match = re.search(r'end_(\d{8})\.', f)
-        if match:
-            dates.add(match.group(1))
-    sorted_dates = sorted(dates, reverse=True)
-    if len(sorted_dates) < 2:
-        print("Insufficient models available.")
-        exit()
-    second_latest_str = sorted_dates[1]
-    model_files = [f for f in files if f'fade_model' in f and f'end_{second_latest_str}.pth' in f]
-    joblib_files = [f for f in files if 'preprocessors' in f and f'end_{second_latest_str}.joblib' in f]
-    if not model_files or not joblib_files:
-        print("Model or preprocessor files not found for second latest date.")
-        exit()
-    model_key = model_files[0]
-    joblib_key = joblib_files[0]
-    obj = s3.get_object(Bucket=s3_bucket, Key=joblib_key)
-    with io.BytesIO(obj['Body'].read()) as buffer:
-        preprocessors = joblib.load(buffer)
-    scaler = preprocessors['scaler']
-    encoders = preprocessors['encoders']
-    obj = s3.get_object(Bucket=s3_bucket, Key=model_key)
-    with io.BytesIO(obj['Body'].read()) as buffer:
-        state_dict = torch.load(buffer, map_location=torch.device('cpu'))  # Added map_location to load on CPU
-    filename = os.path.basename(model_key)
-    sequence_length, _, hidden_size, num_layers, _, _, _ = parse_hyperparams(
-        filename)
-    df, numerical_cols, categorical_cols, untransformed_df = preprocess_df(df, encoders, scaler)
-    vocab_sizes = {col: len(encoders[col].classes_) + 1 for col in categorical_cols}
-    embed_dim = 16
-    input_size_num = len(numerical_cols)
-    model = LSTMModel(input_size_num, categorical_cols, vocab_sizes, embed_dim, hidden_size, num_layers)
-    for name, param in state_dict.items():
-        if 'embeddings' in name and 'weight' in name:
-            model_param = model.state_dict()[name]
-            if model_param.shape[0] > param.shape[0] and model_param.shape[1:] == param.shape[1:]:
-                model_param[:param.shape[0]].copy_(param)
-                model_param[param.shape[0]:] = model_param[:param.shape[0]].mean(dim=0)
-            elif model_param.shape == param.shape:
-                model_param.copy_(param)
+    previous_last_modified = None
+    while True:
+        try:
+            head = s3.head_object(Bucket=s3_bucket, Key=s3_key)
+            current_last_modified = head['LastModified']
+            if previous_last_modified is None or current_last_modified > previous_last_modified:
+                print(f"File updated at {current_last_modified}. Running predictions.")
+
+                obj = s3.get_object(Bucket=s3_bucket, Key=s3_key)
+                df = pd.read_csv(obj['Body'], encoding='latin1')
+                df["Date"] = pd.to_datetime(df["Date"], format = "%Y-%m-%d")
+                most_recent_date = df['Date'].max()
+                most_recent_str = most_recent_date.strftime('%Y%m%d')
+                response = s3.list_objects_v2(Bucket=s3_bucket, Prefix='models/')
+                files = [obj['Key'] for obj in response.get('Contents', []) if 'end_' in obj['Key']]
+                dates = set()
+                for f in files:
+                    match = re.search(r'end_(\d{8})\.', f)
+                    if match:
+                        dates.add(match.group(1))
+                sorted_dates = sorted(dates, reverse=True)
+                if len(sorted_dates) < 2:
+                    print("Insufficient models available.")
+                    exit()
+                second_latest_str = sorted_dates[1]
+                model_files = [f for f in files if f'fade_model' in f and f'end_{second_latest_str}.pth' in f]
+                joblib_files = [f for f in files if 'preprocessors' in f and f'end_{second_latest_str}.joblib' in f]
+                if not model_files or not joblib_files:
+                    print("Model or preprocessor files not found for second latest date.")
+                    exit()
+                model_key = model_files[0]
+                joblib_key = joblib_files[0]
+                obj = s3.get_object(Bucket=s3_bucket, Key=joblib_key)
+                with io.BytesIO(obj['Body'].read()) as buffer:
+                    preprocessors = joblib.load(buffer)
+                scaler = preprocessors['scaler']
+                encoders = preprocessors['encoders']
+                obj = s3.get_object(Bucket=s3_bucket, Key=model_key)
+                with io.BytesIO(obj['Body'].read()) as buffer:
+                    state_dict = torch.load(buffer, map_location=torch.device('cpu'))  # Added map_location to load on CPU
+                filename = os.path.basename(model_key)
+                sequence_length, _, hidden_size, num_layers, _, _, _ = parse_hyperparams(
+                    filename)
+                df, numerical_cols, categorical_cols, untransformed_df = preprocess_df(df, encoders, scaler)
+                vocab_sizes = {col: len(encoders[col].classes_) + 1 for col in categorical_cols}
+                embed_dim = 16
+                input_size_num = len(numerical_cols)
+                model = LSTMModel(input_size_num, categorical_cols, vocab_sizes, embed_dim, hidden_size, num_layers)
+                for name, param in state_dict.items():
+                    if 'embeddings' in name and 'weight' in name:
+                        model_param = model.state_dict()[name]
+                        if model_param.shape[0] > param.shape[0] and model_param.shape[1:] == param.shape[1:]:
+                            model_param[:param.shape[0]].copy_(param)
+                            model_param[param.shape[0]:] = model_param[:param.shape[0]].mean(dim=0)
+                        elif model_param.shape == param.shape:
+                            model_param.copy_(param)
+                        else:
+                            raise ValueError(f"Shape mismatch for {name}")
+                    else:
+                        model.state_dict()[name].copy_(param)
+                model.eval()
+                predictions = []
+                groups = df.groupby('Account')
+                for name, group in groups:
+                    group = group.sort_values('Date').reset_index()
+                    infer_rows = group[group['Date'] == most_recent_date]
+                    for _, row in infer_rows.iterrows():
+                        m = row.name
+                        if m < sequence_length:
+                            continue
+                        seq_num = group.iloc[m - sequence_length:m][numerical_cols].values
+                        seq_cat = group.iloc[m - sequence_length:m][categorical_cols].values
+                        seq_num_t = torch.tensor(seq_num).float().unsqueeze(0)
+                        seq_cat_t = torch.tensor(seq_cat).long().unsqueeze(0)
+                        with torch.no_grad():
+                            logit = model(seq_num_t, seq_cat_t).squeeze()
+                            prob = torch.sigmoid(logit).item()
+                        predictions.append({'Account': name, 'Prob_W': prob, **untransformed_df.loc[row['index']].to_dict()})
+                pred_df = pd.DataFrame(predictions)
+                columns = ['Date', 'Account', 'Prob_W'] + [col for col in pred_df.columns if
+                                                           col not in ['Date', 'Account', 'Prob_W']]
+                pred_df = pred_df[columns]
+                pred_df = pred_df.sort_values('Prob_W', ascending=True)
+                csv_buffer = io.StringIO()
+                pred_df.to_csv(csv_buffer, index=False)
+                s3.put_object(Bucket=s3_bucket, Key=f'predictions/pred_{most_recent_str}.csv', Body=csv_buffer.getvalue())
+                csv_buffer.seek(0)
+                url = f"https://api.telegram.org/bot{telegram_bot_token}/sendDocument"
+                files = {'document': (f'pred_{most_recent_str}.csv', csv_buffer.getvalue().encode('utf-8'))}
+                data = {'chat_id': telegram_chat_id, 'caption': 'Predicted bets'}
+                response = requests.post(url, data=data, files=files)
+                if response.status_code != 200:
+                    print(f"Failed to send Telegram message: {response.text}")
+                previous_last_modified = current_last_modified
             else:
-                raise ValueError(f"Shape mismatch for {name}")
-        else:
-            model.state_dict()[name].copy_(param)
-    model.eval()
-    predictions = []
-    groups = df.groupby('Account')
-    for name, group in groups:
-        group = group.sort_values('Date').reset_index()
-        infer_rows = group[group['Date'] == most_recent_date]
-        for _, row in infer_rows.iterrows():
-            m = row.name
-            if m < sequence_length:
-                continue
-            seq_num = group.iloc[m - sequence_length:m][numerical_cols].values
-            seq_cat = group.iloc[m - sequence_length:m][categorical_cols].values
-            seq_num_t = torch.tensor(seq_num).float().unsqueeze(0)
-            seq_cat_t = torch.tensor(seq_cat).long().unsqueeze(0)
-            with torch.no_grad():
-                logit = model(seq_num_t, seq_cat_t).squeeze()
-                prob = torch.sigmoid(logit).item()
-            predictions.append({'Account': name, 'Prob_W': prob, **untransformed_df.loc[row['index']].to_dict()})
-    pred_df = pd.DataFrame(predictions)
-    columns = ['Date', 'Account', 'Prob_W'] + [col for col in pred_df.columns if
-                                               col not in ['Date', 'Account', 'Prob_W']]
-    pred_df = pred_df[columns]
-    pred_df = pred_df.sort_values('Prob_W', ascending=True)
-    csv_buffer = io.StringIO()
-    pred_df.to_csv(csv_buffer, index=False)
-    s3.put_object(Bucket=s3_bucket, Key=f'predictions/pred_{most_recent_str}.csv', Body=csv_buffer.getvalue())
-    csv_buffer.seek(0)
-    url = f"https://api.telegram.org/bot{telegram_bot_token}/sendDocument"
-    files = {'document': (f'pred_{most_recent_str}.csv', csv_buffer.getvalue().encode('utf-8'))}
-    data = {'chat_id': telegram_chat_id, 'caption': 'Predicted bets'}
-    response = requests.post(url, data=data, files=files)
-    if response.status_code != 200:
-        print(f"Failed to send Telegram message: {response.text}")
+                print(f"No update at {datetime.now(timezone.utc)}. Sleeping.")
+            time.sleep(600)
+        except Exception as e:
+            print(f"Error: {e}")
+            time.sleep(600)
