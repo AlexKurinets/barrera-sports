@@ -59,6 +59,6 @@ while True:
         s3.put_object(Bucket=s3_bucket, Key=s3_key, Body=csv_buffer.getvalue())
         logging.info(f"{datetime.now().strftime('%Y-%m-%d')} Loaded {len(df_append)} new records.")
     else:
-        print("No new records.")
+        logging.info("No new records.")
         logging.info(f"{datetime.now().strftime('%Y-%m-%d')} No new records.")
     time.sleep(600)  # Sleep for 10 minutes
