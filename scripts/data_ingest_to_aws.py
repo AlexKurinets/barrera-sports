@@ -10,7 +10,10 @@ import os
 from datetime import datetime
 
 os.makedirs('logs', exist_ok=True)
-logging.basicConfig(filename='logs/data_ingest_to_aws.log', level=logging.INFO)
+logging.basicConfig(
+    filename=f"C:/users/Administrator/barrera-sports/logs/data_ingest_to_aws_{datetime.now().strftime('%Y%m%d%H%M%S')}.log",
+    level=logging.INFO
+)
 
 # Get secrets
 secrets_client = boto3.client('secretsmanager', region_name='us-east-2')
