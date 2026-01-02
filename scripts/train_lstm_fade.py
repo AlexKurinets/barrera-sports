@@ -13,6 +13,14 @@ import os
 import io
 import joblib
 import torch.nn.functional as F  # Added for binary_cross_entropy_with_logits
+from datetime import datetime
+import logging
+
+os.makedirs('logs', exist_ok=True)
+logging.basicConfig(
+    filename=f"C:/users/Administrator/barrera-sports/logs/train_lstm_fade_{datetime.now().strftime('%Y%m%d%H%M%S')}.log",
+    level=logging.INFO
+)
 
 class BetDataset(Dataset):
     def __init__(self, data):
@@ -41,7 +49,7 @@ class LSTMModel(nn.Module):  # Updated LSTMModel to include embeddings for categ
         return out
 
 def train_batch(end_date, config, df, s3, s3_bucket):
-    print(f"Training LSTM model for end_date {end_date}...")
+    logging.info(f"Training LSTM model for end_date {end_date}...")
     seed = 42
     random.seed(seed)
     np.random.seed(seed)
@@ -82,7 +90,7 @@ def train_batch(end_date, config, df, s3, s3_bucket):
                                           errors='coerce')
     df_batch[numerical_cols] = df_batch[numerical_cols].fillna(0)
     df_batch['Target'] = (df_batch['W/L'] == 'W').astype(float)  # Changed to binary: 1 for W, 0 for L
-    print(f"Win rate for {end_date}: {df_batch['Target'].mean():.4f}")  # Added print win rate to check balance
+    logging.info(f"Win rate for {end_date}: {df_batch['Target'].mean():.4f}")  # Added print win rate to check balance
     # Add engineered features
     df_batch['Win'] = (df_batch['W/L'] == 'W').astype(float)
     df_batch['Rolling_Win_Pct_5'] = df_batch.groupby('Account')['Win'].transform(
@@ -192,7 +200,8 @@ def train_batch(end_date, config, df, s3, s3_bucket):
     scaler = StandardScaler().fit(df_batch[numerical_cols])
     df_batch[numerical_cols] = scaler.transform(df_batch[numerical_cols])
     preprocessors = {'scaler': scaler, 'encoders': encoders}
-    joblib_filename = f'output/models/preprocessors_{hyperparams_str}_end_{end_date_str}.joblib'
+    joblib_filename = (f'c:/users/administrator/barrera-sports/output/models/'
+                       f'preprocessors_{hyperparams_str}_end_{end_date_str}.joblib')
     os.makedirs(os.path.dirname(joblib_filename), exist_ok=True)
     joblib.dump(preprocessors, joblib_filename)
     s3_key_joblib = 'models/' + os.path.basename(joblib_filename)
@@ -227,7 +236,8 @@ def train_batch(end_date, config, df, s3, s3_bucket):
     model = model.to(device)
     criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=l2_reg)
-    log_dir = f"output/tensorboard/runs/{hyperparams_str}/{hyperparams_str}_end_{end_date_str}"
+    log_dir = (f"c:/users/administrator/barrera-sports/output/tensorboard/runs/"
+               f"{hyperparams_str}/{hyperparams_str}_end_{end_date_str}")
     os.makedirs(log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=log_dir)
     min_val_loss = float('inf')
@@ -279,7 +289,7 @@ def train_batch(end_date, config, df, s3, s3_bucket):
             if account_counts[acc] > 0:
                 acc_val_loss = account_losses[acc] / account_counts[acc]
                 writer.add_scalar(f'Loss/val_account_{acc}', acc_val_loss, epoch)
-        print(f'Epoch {epoch + 1}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f} for end_date {end_date}')
+        logging.info(f'Epoch {epoch + 1}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f} for end_date {end_date}')
         if val_loss < min_val_loss:
             min_val_loss = val_loss
             counter = 0
@@ -291,7 +301,8 @@ def train_batch(end_date, config, df, s3, s3_bucket):
                 break
     writer.close()
     # Save best model
-    filename = (f'output/models/'
+    filename = (f'c:/users/administrator/barrera-sports/'
+                f'output/models/'
                 f'fade_model_seq_{sequence_length}_'
                 f'bs_{batch_size}_'
                 f'hs_{hidden_size}_'
@@ -340,5 +351,5 @@ if __name__ == "__main__":
     min_rows_batch = config['min_rows_batch']
     end_dates = [d for d in unique_dates if cum_rows[d] >= min_rows_batch]
     # Sequential processing
-    for end_date in end_dates[-1:]: # Use only the last end_date for single model
+    for end_date in end_dates[-1]: # Use only the last end_date for single model
         train_batch(end_date, config, df, s3, s3_bucket)
