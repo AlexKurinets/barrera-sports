@@ -11,6 +11,13 @@ import re
 import requests
 import time
 from datetime import datetime, timezone
+import logging
+
+os.makedirs('logs', exist_ok=True)
+logging.basicConfig(
+    filename=f"C:/users/Administrator/barrera-sports/logs/predict_lstm_fade_{datetime.now().strftime('%Y%m%d%H%M%S')}.log",
+    level=logging.INFO
+)
 
 class LSTMModel(nn.Module):
     def __init__(self, input_size_num, cat_cols, vocab_sizes, embed_dim, hidden_size, num_layers):
@@ -134,7 +141,7 @@ if __name__ == "__main__":
             head = s3.head_object(Bucket=s3_bucket, Key=s3_key)
             current_last_modified = head['LastModified']
             if previous_last_modified is None or current_last_modified > previous_last_modified:
-                print(f"File updated at {current_last_modified}. Running predictions.")
+                logging.info(f"File updated at {current_last_modified}. Running predictions.")
 
                 obj = s3.get_object(Bucket=s3_bucket, Key=s3_key)
                 df = pd.read_csv(obj['Body'], encoding='latin1')
@@ -150,13 +157,13 @@ if __name__ == "__main__":
                         dates.add(match.group(1))
                 sorted_dates = sorted(dates, reverse=True)
                 if len(sorted_dates) < 2:
-                    print("Insufficient models available.")
+                    logging.info("Insufficient models available.")
                     exit()
                 second_latest_str = sorted_dates[1]
                 model_files = [f for f in files if f'fade_model' in f and f'end_{second_latest_str}.pth' in f]
                 joblib_files = [f for f in files if 'preprocessors' in f and f'end_{second_latest_str}.joblib' in f]
                 if not model_files or not joblib_files:
-                    print("Model or preprocessor files not found for second latest date.")
+                    logging.info("Model or preprocessor files not found for second latest date.")
                     exit()
                 model_key = model_files[0]
                 joblib_key = joblib_files[0]
@@ -220,11 +227,11 @@ if __name__ == "__main__":
                 data = {'chat_id': telegram_chat_id, 'caption': 'Predicted bets'}
                 response = requests.post(url, data=data, files=files)
                 if response.status_code != 200:
-                    print(f"Failed to send Telegram message: {response.text}")
+                    logging.info(f"Failed to send Telegram message: {response.text}")
                 previous_last_modified = current_last_modified
             else:
-                print(f"No update at {datetime.now(timezone.utc)}. Sleeping.")
+                logging.info(f"No update at {datetime.now().strftime('Y-%m-%d %H:%M:%S')}. Sleeping.")
             time.sleep(600)
         except Exception as e:
-            print(f"Error: {e}")
+            logging.info(f"Error: {e}")
             time.sleep(600)

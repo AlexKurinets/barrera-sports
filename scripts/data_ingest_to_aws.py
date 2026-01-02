@@ -42,8 +42,8 @@ while True:
     try:
         obj = s3.get_object(Bucket=s3_bucket, Key=s3_key)
         df_existing = pd.read_csv(obj['Body'])
-        max_date = df_existing['Date'].max()
-        df_append = df_new[df_new['Date'] > max_date]
+        df_merged = df_new.merge(df_existing, how='left', indicator=True)
+        df_append = df_merged[df_merged['_merge'] == 'left_only'].drop(columns=['_merge'])
     except ClientError as e:
         if e.response['Error']['Code'] == 'NoSuchKey':
             df_append = df_new
@@ -57,8 +57,7 @@ while True:
         csv_buffer = StringIO()
         df_updated.to_csv(csv_buffer, index=False)
         s3.put_object(Bucket=s3_bucket, Key=s3_key, Body=csv_buffer.getvalue())
-        logging.info(f"{datetime.now().strftime('%Y-%m-%d')} Loaded {len(df_append)} new records.")
+        logging.info(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Loaded {len(df_append)} new records.")
     else:
-        logging.info("No new records.")
-        logging.info(f"{datetime.now().strftime('%Y-%m-%d')} No new records.")
+        logging.info(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} No new records.")
     time.sleep(600)  # Sleep for 10 minutes
