@@ -251,7 +251,7 @@ def train_batch(end_date, config, df, s3, s3_bucket):
             seqs_cat = seqs_cat.to(device)
             labels = labels.to(device)
             optimizer.zero_grad()
-            outputs = model(seqs_num, seqs_cat).squeeze()
+            outputs = model(seqs_num, seqs_cat).view(-1)
             loss = criterion(outputs, labels)
             if l1_reg > 0:
                 l1_penalty = sum(p.abs().sum() for p in model.parameters())
@@ -270,7 +270,7 @@ def train_batch(end_date, config, df, s3, s3_bucket):
                 seqs_num = seqs_num.to(device)
                 seqs_cat = seqs_cat.to(device)
                 labels = labels.to(device)
-                outputs = model(seqs_num, seqs_cat).squeeze()
+                outputs = model(seqs_num, seqs_cat).view(-1)
                 for out, lab, acc in zip(outputs, labels, accounts):
                     loss_item = F.binary_cross_entropy_with_logits(out, lab,
                                                                    reduction='sum').item()  # Changed from MSE to BCE
