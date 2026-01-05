@@ -42,21 +42,39 @@ while True:
     try:
         obj = s3.get_object(Bucket=s3_bucket, Key=s3_key)
         df_existing = pd.read_csv(obj['Body'])
-        df_merged = df_new.merge(df_existing, how='left', indicator=True)
-        df_append = df_merged[df_merged['_merge'] == 'left_only'].drop(columns=['_merge'])
+        key_columns = ['Account', 'Bet Number']
+        df_new_indexed = df_new.set_index(key_columns)
+        df_existing_indexed = df_existing.set_index(key_columns)
+        new_keys = df_new_indexed.index.difference(df_existing_indexed.index)
+        df_append = df_new_indexed.loc[new_keys].reset_index()
+        common_keys = df_new_indexed.index.intersection(df_existing_indexed.index)
+        updated_rows = 0
+        if not common_keys.empty:
+            df_common_old = df_existing_indexed.loc[common_keys].copy()
+            df_existing_indexed.update(df_new_indexed.loc[common_keys])
+            df_common_new = df_existing_indexed.loc[common_keys]
+            updated_mask = ~(df_common_old == df_common_new).all(axis=1)
+            updated_rows = updated_mask.sum()
+            if updated_rows > 0:
+                logging.info(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Updated {updated_rows} existing records.")
+        df_updated_indexed = df_existing_indexed
+        if not new_keys.empty:
+            df_updated_indexed = pd.concat([df_updated_indexed, df_new_indexed.loc[new_keys]])
+        df_updated = df_updated_indexed.reset_index()
     except ClientError as e:
         if e.response['Error']['Code'] == 'NoSuchKey':
             df_append = df_new
             df_existing = pd.DataFrame(columns=df_new.columns)
+            df_updated = df_new
+            updated_rows = 0
         else:
             raise
-
-    # Upload new records
-    if not df_append.empty:
-        df_updated = pd.concat([df_existing, df_append], ignore_index=True)
+        # Upload updated data if there are new records or updates
+    if not df_append.empty or updated_rows > 0:
         csv_buffer = StringIO()
         df_updated.to_csv(csv_buffer, index=False)
         s3.put_object(Bucket=s3_bucket, Key=s3_key, Body=csv_buffer.getvalue())
+    if not df_append.empty:
         logging.info(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Loaded {len(df_append)} new records.")
     else:
         logging.info(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} No new records.")
