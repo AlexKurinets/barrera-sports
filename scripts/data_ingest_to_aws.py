@@ -33,6 +33,10 @@ while True:
     csv_content = response.content.decode('utf-8')
     df_new = pd.read_csv(StringIO(csv_content))
     df_new['Date'] = pd.to_datetime(df_new['Date']).dt.strftime("%Y-%m-%d")
+    df_new['Account'] = df_new['Account'].astype(str).str.strip()
+    df_new['Bet Number'] = pd.to_numeric(df_new['Bet Number'].astype(str).str.replace(',', ''), errors='coerce')
+    df_new = df_new.drop_duplicates(subset=['Account', 'Bet Number'], keep='last')
+    df_new = df_new.fillna('')
 
     # S3 setup
     s3 = boto3.client('s3', aws_access_key_id=aws_access_key, aws_secret_access_key=aws_secret_key)
@@ -42,6 +46,11 @@ while True:
     try:
         obj = s3.get_object(Bucket=s3_bucket, Key=s3_key)
         df_existing = pd.read_csv(obj['Body'])
+        df_existing['Account'] = df_existing['Account'].astype(str).str.strip()
+        df_existing['Bet Number'] = pd.to_numeric(df_existing['Bet Number'].astype(str).str.replace(',', ''),
+                                                  errors='coerce')
+        df_existing = df_existing.drop_duplicates(subset=['Account', 'Bet Number'], keep='last')
+        df_existing = df_existing.fillna('')
         key_columns = ['Account', 'Bet Number']
         df_new_indexed = df_new.set_index(key_columns)
         df_existing_indexed = df_existing.set_index(key_columns)
@@ -51,9 +60,11 @@ while True:
         updated_mask = None
         if not common_keys.empty:
             df_common_old = df_existing_indexed.loc[common_keys].copy()
-            df_existing_indexed.update(df_new_indexed.loc[common_keys])
-            df_common_new = df_existing_indexed.loc[common_keys]
-            updated_mask = ~(df_common_old == df_common_new).all(axis=1)
+            df_common_new = df_new_indexed.loc[common_keys].copy()
+            df_common_old = df_common_old.apply(lambda col: col.str.strip() if col.dtype == 'object' else col)
+            df_common_new = df_common_new.apply(lambda col: col.str.strip() if col.dtype == 'object' else col)
+            is_equal = (df_common_old == df_common_new) | (df_common_old.isnull() & df_common_new.isnull())
+            updated_mask = ~is_equal.all(axis=1)
             updated_rows = updated_mask.sum()
             if updated_rows > 0:
                 logging.info(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Updated {updated_rows} existing records.")
@@ -71,14 +82,17 @@ while True:
         df_updated = df_updated_indexed.reset_index()
     except ClientError as e:
         if e.response['Error']['Code'] == 'NoSuchKey':
-            df_append = df_new
+            df_new['Account'] = df_new['Account'].astype(str).str.strip()
+            df_new['Bet Number'] = pd.to_numeric(df_new['Bet Number'].astype(str).str.replace(',', ''), errors='coerce')
+            df_append = df_new.drop_duplicates(subset=['Account', 'Bet Number'], keep='last').fillna('')
             df_existing = pd.DataFrame(columns=df_new.columns)
-            df_updated = df_new
+            df_updated = df_append
             updated_rows = 0
         else:
             raise
-        # Upload updated data if there are new records or updates
-    if not df_append.empty or updated_rows > 0:
+
+    # Upload updated data if there are new records or updates
+    if not df_append.empty:
         csv_buffer = StringIO()
         df_updated.to_csv(csv_buffer, index=False)
         s3.put_object(Bucket=s3_bucket, Key=s3_key, Body=csv_buffer.getvalue())
