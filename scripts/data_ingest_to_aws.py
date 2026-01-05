@@ -93,6 +93,9 @@ while True:
 
     # Upload updated data if there are new records or updates
     if not df_append.empty:
+        df_updated['Date'] = pd.to_datetime(df_updated['Date'])
+        df_updated = df_updated.sort_values('Date', ascending=True)
+        df_updated['Date'] = df_updated['Date'].dt.strftime("%Y-%m-%d")
         csv_buffer = StringIO()
         df_updated.to_csv(csv_buffer, index=False)
         s3.put_object(Bucket=s3_bucket, Key=s3_key, Body=csv_buffer.getvalue())
