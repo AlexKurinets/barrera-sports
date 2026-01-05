@@ -351,5 +351,5 @@ if __name__ == "__main__":
     min_rows_batch = config['min_rows_batch']
     end_dates = [d for d in unique_dates if cum_rows[d] >= min_rows_batch]
     # Sequential processing
-    for end_date in end_dates[-1]: # Use only the last end_date for single model
+    for end_date in end_dates[-1:]: # Use only the last end_date for single model
         train_batch(end_date, config, df, s3, s3_bucket)
