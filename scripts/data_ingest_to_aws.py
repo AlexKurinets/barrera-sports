@@ -33,6 +33,10 @@ while True:
     csv_content = response.content.decode('utf-8')
     df_new = pd.read_csv(StringIO(csv_content))
     df_new['Date'] = pd.to_datetime(df_new['Date']).dt.strftime("%Y-%m-%d")
+    df_new['Account'] = df_new['Account'].astype(str).str.strip()
+    df_new['Bet Number'] = pd.to_numeric(df_new['Bet Number'].astype(str).str.replace(',', ''), errors='coerce')
+    df_new = df_new.drop_duplicates(subset=['Account', 'Bet Number'], keep='last')
+    df_new = df_new.fillna('')
 
     # S3 setup
     s3 = boto3.client('s3', aws_access_key_id=aws_access_key, aws_secret_access_key=aws_secret_key)
@@ -42,23 +46,58 @@ while True:
     try:
         obj = s3.get_object(Bucket=s3_bucket, Key=s3_key)
         df_existing = pd.read_csv(obj['Body'])
-        max_date = df_existing['Date'].max()
-        df_append = df_new[df_new['Date'] > max_date]
+        df_existing['Account'] = df_existing['Account'].astype(str).str.strip()
+        df_existing['Bet Number'] = pd.to_numeric(df_existing['Bet Number'].astype(str).str.replace(',', ''),
+                                                  errors='coerce')
+        df_existing = df_existing.drop_duplicates(subset=['Account', 'Bet Number'], keep='last')
+        df_existing = df_existing.fillna('')
+        key_columns = ['Account', 'Bet Number']
+        df_new_indexed = df_new.set_index(key_columns)
+        df_existing_indexed = df_existing.set_index(key_columns)
+        new_keys = df_new_indexed.index.difference(df_existing_indexed.index)
+        common_keys = df_new_indexed.index.intersection(df_existing_indexed.index)
+        updated_rows = 0
+        updated_mask = None
+        if not common_keys.empty:
+            df_common_old = df_existing_indexed.loc[common_keys].copy()
+            df_common_new = df_new_indexed.loc[common_keys].copy()
+            df_common_old = df_common_old.apply(lambda col: col.str.strip() if col.dtype == 'object' else col)
+            df_common_new = df_common_new.apply(lambda col: col.str.strip() if col.dtype == 'object' else col)
+            is_equal = (df_common_old == df_common_new) | (df_common_old.isnull() & df_common_new.isnull())
+            updated_mask = ~is_equal.all(axis=1)
+            updated_rows = updated_mask.sum()
+            if updated_rows > 0:
+                logging.info(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Updated {updated_rows} existing records.")
+        updated_keys = common_keys[updated_mask] if updated_mask is not None else pd.MultiIndex.from_arrays(
+            [[] for _ in key_columns])
+        df_new_rows = df_new_indexed.loc[new_keys].reset_index() if not new_keys.empty else pd.DataFrame(
+            columns=df_new.columns)
+        df_updated_rows = df_new_indexed.loc[updated_keys].reset_index() if not updated_keys.empty else pd.DataFrame(
+            columns=df_new.columns)
+        df_append = pd.concat([df_new_rows, df_updated_rows], ignore_index=True)
+        df_updated_indexed = df_existing_indexed.drop(updated_keys, errors='ignore')
+        if not df_append.empty:
+            df_append_indexed = df_append.set_index(key_columns)
+            df_updated_indexed = pd.concat([df_updated_indexed, df_append_indexed])
+        df_updated = df_updated_indexed.reset_index()
     except ClientError as e:
         if e.response['Error']['Code'] == 'NoSuchKey':
-            df_append = df_new
+            df_new['Account'] = df_new['Account'].astype(str).str.strip()
+            df_new['Bet Number'] = pd.to_numeric(df_new['Bet Number'].astype(str).str.replace(',', ''), errors='coerce')
+            df_append = df_new.drop_duplicates(subset=['Account', 'Bet Number'], keep='last').fillna('')
             df_existing = pd.DataFrame(columns=df_new.columns)
+            df_updated = df_append
+            updated_rows = 0
         else:
             raise
 
-    # Upload new records
+    # Upload updated data if there are new records or updates
     if not df_append.empty:
-        df_updated = pd.concat([df_existing, df_append], ignore_index=True)
         csv_buffer = StringIO()
         df_updated.to_csv(csv_buffer, index=False)
         s3.put_object(Bucket=s3_bucket, Key=s3_key, Body=csv_buffer.getvalue())
-        logging.info(f"{datetime.now().strftime('%Y-%m-%d')} Loaded {len(df_append)} new records.")
+    if not df_append.empty:
+        logging.info(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Loaded {len(df_append)} new records.")
     else:
-        logging.info("No new records.")
-        logging.info(f"{datetime.now().strftime('%Y-%m-%d')} No new records.")
+        logging.info(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} No new records.")
     time.sleep(600)  # Sleep for 10 minutes
