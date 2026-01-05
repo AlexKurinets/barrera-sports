@@ -46,9 +46,9 @@ while True:
         df_new_indexed = df_new.set_index(key_columns)
         df_existing_indexed = df_existing.set_index(key_columns)
         new_keys = df_new_indexed.index.difference(df_existing_indexed.index)
-        df_append = df_new_indexed.loc[new_keys].reset_index()
         common_keys = df_new_indexed.index.intersection(df_existing_indexed.index)
         updated_rows = 0
+        updated_mask = None
         if not common_keys.empty:
             df_common_old = df_existing_indexed.loc[common_keys].copy()
             df_existing_indexed.update(df_new_indexed.loc[common_keys])
@@ -57,9 +57,17 @@ while True:
             updated_rows = updated_mask.sum()
             if updated_rows > 0:
                 logging.info(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Updated {updated_rows} existing records.")
-        df_updated_indexed = df_existing_indexed
-        if not new_keys.empty:
-            df_updated_indexed = pd.concat([df_updated_indexed, df_new_indexed.loc[new_keys]])
+        updated_keys = common_keys[updated_mask] if updated_mask is not None else pd.MultiIndex.from_arrays(
+            [[] for _ in key_columns])
+        df_new_rows = df_new_indexed.loc[new_keys].reset_index() if not new_keys.empty else pd.DataFrame(
+            columns=df_new.columns)
+        df_updated_rows = df_new_indexed.loc[updated_keys].reset_index() if not updated_keys.empty else pd.DataFrame(
+            columns=df_new.columns)
+        df_append = pd.concat([df_new_rows, df_updated_rows], ignore_index=True)
+        df_updated_indexed = df_existing_indexed.drop(updated_keys, errors='ignore')
+        if not df_append.empty:
+            df_append_indexed = df_append.set_index(key_columns)
+            df_updated_indexed = pd.concat([df_updated_indexed, df_append_indexed])
         df_updated = df_updated_indexed.reset_index()
     except ClientError as e:
         if e.response['Error']['Code'] == 'NoSuchKey':
