@@ -198,8 +198,17 @@ if __name__ == "__main__":
                 most_recent_bet_date_str = most_recent_bet_date.strftime('%Y%m%d')
                 if not should_run:
                     continue
-                response = s3.list_objects_v2(Bucket=s3_bucket, Prefix='models/')
-                files = [obj['Key'] for obj in response.get('Contents', []) if 'end_' in obj['Key']]
+                files = []
+                continuation_token = None
+                while True:
+                    kwargs = {'Bucket': s3_bucket, 'Prefix': 'models/'}
+                    if continuation_token:
+                        kwargs['ContinuationToken'] = continuation_token
+                    response = s3.list_objects_v2(**kwargs)
+                    files.extend([obj['Key'] for obj in response.get('Contents', []) if 'end_' in obj['Key']])
+                    if 'NextContinuationToken' not in response:
+                        break
+                    continuation_token = response['NextContinuationToken']
                 dates = set()
                 for f in files:
                     match = re.search(r'end_(\d{8})\.', f)
