@@ -264,9 +264,21 @@ if __name__ == "__main__":
                         with torch.no_grad():
                             logit = model(seq_num_t, seq_cat_t).squeeze()
                             prob = torch.sigmoid(logit).item()
+                            prob = round(prob, 3)
                         predictions.append(
                             {'Account': name, 'Prob_W': prob, **untransformed_df.loc[row['index']].to_dict()})
                 pred_raw_df = pd.DataFrame(predictions)
+                pred_raw_df["Date"] = pd.to_datetime(pred_raw_df["Date"]).dt.strftime("%Y-%m-%d")
+                if filter_mode == 'new':
+                    pred_raw_key = f'predictions/pred_raw_{most_recent_bet_date_str}.csv'
+                    try:
+                        obj = s3.get_object(Bucket=s3_bucket, Key=pred_raw_key)
+                        existing_pred_raw_df = pd.read_csv(obj['Body'])
+                        pred_raw_df = pd.concat([existing_pred_raw_df, pred_raw_df], ignore_index=True)
+                        pred_raw_df = pred_raw_df.drop_duplicates()
+                    except ClientError as e:
+                        if e.response['Error']['Code'] != 'NoSuchKey':
+                            raise
                 columns = ['Date', 'Account', 'Prob_W'] + [col for col in pred_raw_df.columns if
                                                            col not in ['Date', 'Account', 'Prob_W']]
                 pred_raw_df = pred_raw_df[columns]
@@ -281,7 +293,7 @@ if __name__ == "__main__":
                                    'Odds', 'Type',
                                    'Spread', 'Spread Type',
                                    'Total', 'Total Type']
-                pred_df = pred_raw_df[pred_df_columns ]
+                pred_df = pred_raw_df[pred_df_columns]
                 csv_buffer = io.StringIO()
                 pred_df.to_csv(csv_buffer, index=False)
                 s3.put_object(Bucket=s3_bucket, Key=f'predictions/pred_{most_recent_bet_date_str}.csv',
