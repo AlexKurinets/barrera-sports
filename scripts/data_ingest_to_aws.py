@@ -24,6 +24,9 @@ aws_access_key = secrets['aws_access_key_id']
 aws_secret_key = secrets['aws_secret_access_key']
 s3_bucket = secrets['bucket_name']
 
+s3_key_new = 'bet_data/bet_data_new.csv'
+s3_key_old = 'bet_data/bet_data_old.csv'
+
 while True:
     # Download Google Sheet as CSV
     sheet_id = '1wM00QhayythUnOizO7hIzv4hDHQutmTS'
@@ -40,11 +43,10 @@ while True:
 
     # S3 setup
     s3 = boto3.client('s3', aws_access_key_id=aws_access_key, aws_secret_access_key=aws_secret_key)
-    s3_key = 'bet_data/bet_data.csv'
 
     # Get existing data
     try:
-        obj = s3.get_object(Bucket=s3_bucket, Key=s3_key)
+        obj = s3.get_object(Bucket=s3_bucket, Key=s3_key_new)
         df_existing = pd.read_csv(obj['Body'])
         df_existing['Account'] = df_existing['Account'].astype(str).str.strip()
         df_existing['Bet Number'] = pd.to_numeric(df_existing['Bet Number'].astype(str).str.replace(',', ''),
@@ -98,7 +100,16 @@ while True:
         df_updated['Date'] = df_updated['Date'].dt.strftime("%Y-%m-%d")
         csv_buffer = StringIO()
         df_updated.to_csv(csv_buffer, index=False)
-        s3.put_object(Bucket=s3_bucket, Key=s3_key, Body=csv_buffer.getvalue())
+        try:
+            s3.copy_object(Bucket=s3_bucket, CopySource=s3_bucket + '/' + s3_key_new, Key=s3_key_old)
+            logging.info(
+                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Copied previous bet_data_new.csv to bet_data_old.csv.")
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'NoSuchKey':
+                pass
+            else:
+                raise
+        s3.put_object(Bucket=s3_bucket, Key=s3_key_new, Body=csv_buffer.getvalue())
     if not df_append.empty:
         logging.info(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Loaded {len(df_append)} new records.")
     else:
