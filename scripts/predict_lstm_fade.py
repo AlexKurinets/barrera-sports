@@ -305,6 +305,8 @@ if __name__ == "__main__":
                 response = requests.post(url, data=data, files=files)
                 if response.status_code != 200:
                     logging.info(f"Failed to send Telegram message: {response.text}")
+                else:
+                    time.sleep(600)
             else:
                 logging.info("No new rows detected. Skipping predictions.")
             previous_last_modified = current_last_modified
