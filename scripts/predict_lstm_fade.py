@@ -154,8 +154,10 @@ if __name__ == "__main__":
         try:
             head = s3.head_object(Bucket=s3_bucket, Key=s3_key_new)
             current_last_modified = head['LastModified']
+            current_last_modified_str = pd.to_datetime(current_last_modified).tz_convert('US/Eastern').strftime(
+                '%Y-%m-%d %H:%M:%S')
             if previous_last_modified is None or current_last_modified > previous_last_modified:
-                logging.info(f"File updated at {current_last_modified}. Checking for new rows.")
+                logging.info(f"File updated at {current_last_modified_str}. Checking for new rows.")
                 obj = s3.get_object(Bucket=s3_bucket, Key=s3_key_new)
                 df = pd.read_csv(obj['Body'], encoding='latin1')
                 df["Date"] = pd.to_datetime(df["Date"], format="%Y-%m-%d")
