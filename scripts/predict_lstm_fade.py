@@ -186,11 +186,11 @@ if __name__ == "__main__":
                     df_old_indexed = df_old.set_index(key_columns)
                     new_keys = df_indexed.index.difference(df_old_indexed.index)
                     if new_keys.empty:
-                        logging.info("No new rows detected via comparison. Skipping predictions.")
+                        logging.info(f"No new rows detected via comparison. Skipping predictions at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
                         previous_last_modified = current_last_modified
                         should_run = False
                         continue
-                    logging.info(f"{len(new_keys)} new rows detected via comparison. Running predictions.")
+                    logging.info(f"{len(new_keys)} new rows detected via comparison. Running predictions at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
                     most_recent_bet_date = df_indexed.loc[new_keys, 'Date'].max()
                 else:  # 'date'
                     logging.info("Running predictions for most recent date.")
@@ -310,7 +310,7 @@ if __name__ == "__main__":
                 else:
                     time.sleep(600)
             else:
-                logging.info("No new rows detected. Skipping predictions.")
+                logging.info(f"No new rows detected. Skipping predictions at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             previous_last_modified = current_last_modified
         except ClientError as e:
             if e.response['Error']['Code'] == 'NoSuchKey':
