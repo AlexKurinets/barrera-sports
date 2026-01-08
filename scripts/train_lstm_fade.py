@@ -342,7 +342,7 @@ if __name__ == "__main__":
     s3_bucket = secrets['bucket_name']
     # Fetch data from S3
     s3 = boto3.client('s3', aws_access_key_id=aws_access_key, aws_secret_access_key=aws_secret_key)
-    s3_key = 'bet_data/bet_data.csv'
+    s3_key = 'bet_data/bet_data_new.csv'
     obj = s3.get_object(Bucket=s3_bucket, Key=s3_key)
     df = pd.read_csv(obj['Body'], encoding='latin1')
     df["Date"] = pd.to_datetime(df["Date"], format = "%Y-%m-%d")
