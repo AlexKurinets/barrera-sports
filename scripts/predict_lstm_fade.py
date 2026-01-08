@@ -278,6 +278,10 @@ if __name__ == "__main__":
                         existing_pred_raw_df = pd.read_csv(obj['Body'])
                         pred_raw_df = pd.concat([existing_pred_raw_df, pred_raw_df], ignore_index=True)
                         pred_raw_df = pred_raw_df.drop_duplicates()
+                        if len(pred_raw_df) == len(existing_pred_raw_df):
+                            logging.info(f"All new predictions already exist at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}. Skipping.")
+                            previous_last_modified = current_last_modified
+                            raise Exception("No new predictions")
                     except ClientError as e:
                         if e.response['Error']['Code'] != 'NoSuchKey':
                             raise
