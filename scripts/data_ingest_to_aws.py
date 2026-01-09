@@ -72,32 +72,26 @@ while True:
                 logging.info(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Updated {updated_rows} existing records.")
         updated_keys = common_keys[updated_mask] if updated_mask is not None else pd.MultiIndex.from_arrays(
             [[] for _ in key_columns])
-        df_new_rows = df_new_indexed.loc[new_keys].reset_index() if not new_keys.empty else pd.DataFrame(
-            columns=df_new.columns)
-        df_updated_rows = df_new_indexed.loc[updated_keys].reset_index() if not updated_keys.empty else pd.DataFrame(
-            columns=df_new.columns)
-        df_append = pd.concat([df_new_rows, df_updated_rows], ignore_index=True)
-        df_updated_indexed = df_existing_indexed.drop(updated_keys, errors='ignore')
-        if not df_append.empty:
-            df_append_indexed = df_append.set_index(key_columns)
-            df_updated_indexed = pd.concat([df_updated_indexed, df_append_indexed])
+        df_updated_indexed = df_existing_indexed.copy()
+        if not updated_keys.empty:
+            df_updated_indexed.loc[updated_keys] = df_new_indexed.loc[updated_keys]
+        if not new_keys.empty:
+            df_updated_indexed = pd.concat([df_updated_indexed, df_new_indexed.loc[new_keys]])
         df_updated = df_updated_indexed.reset_index()
+        new_rows = len(new_keys) if not new_keys.empty else 0
     except ClientError as e:
         if e.response['Error']['Code'] == 'NoSuchKey':
             df_new['Account'] = df_new['Account'].astype(str).str.strip()
             df_new['Bet Number'] = pd.to_numeric(df_new['Bet Number'].astype(str).str.replace(',', ''), errors='coerce')
-            df_append = df_new.drop_duplicates(subset=['Account', 'Bet Number'], keep='last').fillna('')
+            df_updated = df_new.drop_duplicates(subset=['Account', 'Bet Number'], keep='last').fillna('')
             df_existing = pd.DataFrame(columns=df_new.columns)
-            df_updated = df_append
             updated_rows = 0
+            new_rows = len(df_updated)
         else:
             raise
 
     # Upload updated data if there are new records or updates
-    if not df_append.empty:
-        df_updated['Date'] = pd.to_datetime(df_updated['Date'])
-        df_updated = df_updated.sort_values('Date', ascending=True)
-        df_updated['Date'] = df_updated['Date'].dt.strftime("%Y-%m-%d")
+    if updated_rows > 0 or new_rows > 0:
         csv_buffer = StringIO()
         df_updated.to_csv(csv_buffer, index=False)
         try:
@@ -110,8 +104,8 @@ while True:
             else:
                 raise
         s3.put_object(Bucket=s3_bucket, Key=s3_key_new, Body=csv_buffer.getvalue())
-    if not df_append.empty:
-        logging.info(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Loaded {len(df_append)} new records.")
-    else:
-        logging.info(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} No new records.")
-    time.sleep(600)  # Sleep for 10 minutes
+        if new_rows > 0:
+            logging.info(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Loaded {new_rows} new records.")
+        else:
+            logging.info(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} No new records.")
+        time.sleep(600)  # Sleep for 10 minutes
