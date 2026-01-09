@@ -286,7 +286,7 @@ if __name__ == "__main__":
                         obj = s3.get_object(Bucket=s3_bucket, Key=pred_raw_key)
                         existing_pred_raw_df = pd.read_csv(obj['Body'])
                         pred_raw_df = pd.concat([existing_pred_raw_df, pred_raw_df], ignore_index=True)
-                        pred_raw_df = pred_raw_df.drop_duplicates()
+                        pred_raw_df = pred_raw_df.drop_duplicates(subset=[col for col in pred_raw_df.columns if col != "Prob_W"])
                         if len(pred_raw_df) == len(existing_pred_raw_df):
                             logging.info(f"All new predictions already exist at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}. Skipping.")
                             previous_last_modified = current_last_modified
