@@ -106,6 +106,8 @@ while True:
         s3.put_object(Bucket=s3_bucket, Key=s3_key_new, Body=csv_buffer.getvalue())
         if new_rows > 0:
             logging.info(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Loaded {new_rows} new records.")
-        else:
-            logging.info(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} No new records.")
-        time.sleep(600)  # Sleep for 10 minutes
+        if updated_rows > 0:
+            logging.info(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Updated {updated_rows} existing records (may overlap with new if initial load).")
+    else:
+        logging.info(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} No new or updated records.")
+    time.sleep(600)  # Sleep for 10 minutes
