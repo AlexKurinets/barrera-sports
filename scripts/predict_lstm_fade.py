@@ -10,7 +10,7 @@ import joblib
 import re
 import requests
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import logging
 from botocore.exceptions import ClientError
 import argparse
@@ -49,7 +49,7 @@ def parse_hyperparams(filename):  # Adjusted indices to account for 'fade_model_
     return seq_len, bs, hs, nl, lr, ep, pat
 
 def preprocess_df(df, encoders, scaler):
-    df = df.sort_values(['Account', 'Date'])
+    df = df.sort_values(['Account', 'Date', 'Bet Number'])
     categorical_cols = ['Type', 'Sport', 'League', 'Marketing', 'Spread Type', 'Total Type', 'ML Type',
                         'Odds Bracket', 'Wager Bracket', 'Team', 'Division']
     categorical_cols = [col for col in categorical_cols if col in df.columns]
@@ -134,8 +134,36 @@ if __name__ == "__main__":
         default='new',
         help='Filter mode: "new" for new rows only (default), "date" for most recent date'
     )
+    parser.add_argument(
+        '--backfill_mode',
+        default=False,
+        help='Backfill mode: generate predictions for a range of dates'
+    )
+    parser.add_argument(
+        '--start_date',
+        type=str,
+        default='2025-09-01',
+        help='Start date for backfill (YYYY-MM-DD) -- ignored if backfill_mode is False'
+    )
+    parser.add_argument(
+        '--end_date',
+        type=str,
+        default='2025-12-01',
+        help='End date for backfill (YYYY-MM-DD) -- ignored if backfill_mode is False'
+    )
     args = parser.parse_args()
     filter_mode = args.filter_mode
+    backfill_mode = args.backfill_mode
+    start_date_str = args.start_date
+    end_date_str = args.end_date
+
+    if backfill_mode:
+        if not (start_date_str and end_date_str):
+            raise ValueError("start_date and end_date required for backfill_mode")
+        start_date = datetime.strptime(start_date_str, '%Y-%m-%d')
+        end_date = datetime.strptime(end_date_str, '%Y-%m-%d')
+        filter_mode = 'date'  # Force date mode for backfill
+
     secrets_client = boto3.client('secretsmanager', region_name='us-east-2')
     secret_name = 'secrets_key'
     response = secrets_client.get_secret_value(SecretId=secret_name)
@@ -148,190 +176,340 @@ if __name__ == "__main__":
     s3 = boto3.client('s3', aws_access_key_id=aws_access_key, aws_secret_access_key=aws_secret_key)
     s3_key_new = 'bet_data/bet_data_new.csv'
     s3_key_old = 'bet_data/bet_data_old.csv'
-    previous_last_modified = None
-    previous_df = None
-    while True:
-        try:
-            head = s3.head_object(Bucket=s3_bucket, Key=s3_key_new)
-            current_last_modified = head['LastModified']
-            current_last_modified_str = pd.to_datetime(current_last_modified).tz_convert('US/Eastern').strftime(
-                '%Y-%m-%d %H:%M:%S')
-            if previous_last_modified is None or current_last_modified > previous_last_modified:
-                logging.info(f"File updated at {current_last_modified_str}. Checking for new rows.")
-                obj = s3.get_object(Bucket=s3_bucket, Key=s3_key_new)
-                df = pd.read_csv(obj['Body'], encoding='latin1')
-                df["Date"] = pd.to_datetime(df["Date"], format="%Y-%m-%d")
-                if df.empty:
-                    logging.info("bet_data_new.csv is empty. Skipping predictions.")
-                    previous_last_modified = current_last_modified
-                    continue
-                df['Account'] = df['Account'].astype(str).str.strip()
-                df['Bet Number'] = pd.to_numeric(df['Bet Number'].astype(str).str.replace(',', ''), errors='coerce')
-                should_run = True
-                if filter_mode == 'new':
-                    try:
-                        obj_old = s3.get_object(Bucket=s3_bucket, Key=s3_key_old)
-                        df_old = pd.read_csv(obj_old['Body'], encoding='latin1')
-                        df_old["Date"] = pd.to_datetime(df_old["Date"], format="%Y-%m-%d")
-                        df_old['Account'] = df_old['Account'].astype(str).str.strip()
-                        df_old['Bet Number'] = pd.to_numeric(df_old['Bet Number'].astype(str).str.replace(',', ''),
-                                                             errors='coerce')
-                    except ClientError as e:
-                        if e.response['Error']['Code'] == 'NoSuchKey':
-                            df_old = pd.DataFrame(columns=df.columns)
-                        else:
-                            raise
-                    key_columns = ['Account', 'Bet Number']
-                    df_indexed = df.set_index(key_columns)
-                    df_old_indexed = df_old.set_index(key_columns)
-                    new_keys = df_indexed.index.difference(df_old_indexed.index)
-                    if new_keys.empty:
-                        logging.info(f"No new rows detected via comparison. Skipping predictions at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-                        previous_last_modified = current_last_modified
-                        should_run = False
-                        continue
-                    logging.info(f"{len(new_keys)} new rows detected via comparison. Running predictions at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-                    most_recent_bet_date = df_indexed.loc[new_keys, 'Date'].max()
-                else:  # 'date'
-                    logging.info("Running predictions for most recent date.")
-                    most_recent_bet_date = df['Date'].max()
-                most_recent_bet_date_str = most_recent_bet_date.strftime('%Y%m%d')
-                if not should_run:
-                    continue
-                files = []
-                continuation_token = None
-                while True:
-                    kwargs = {'Bucket': s3_bucket, 'Prefix': 'models/'}
-                    if continuation_token:
-                        kwargs['ContinuationToken'] = continuation_token
-                    response = s3.list_objects_v2(**kwargs)
-                    files.extend([obj['Key'] for obj in response.get('Contents', []) if 'end_' in obj['Key']])
-                    if 'NextContinuationToken' not in response:
-                        break
-                    continuation_token = response['NextContinuationToken']
-                dates = set()
-                for f in files:
-                    match = re.search(r'end_(\d{8})\.', f)
-                    if match:
-                        dates.add(match.group(1))
-                sorted_dates = sorted(dates, reverse=True)
-                if len(sorted_dates) < 2:
-                    logging.info("Insufficient models available.")
-                    continue
-                most_recent_model_date_str = sorted_dates[0]
-                model_files = [f for f in files if f'fade_model' in f and f'end_{most_recent_model_date_str}.pth' in f]
-                joblib_files = [f for f in files if 'preprocessors' in f and f'end_{most_recent_model_date_str}.joblib' in f]
-                if not model_files or not joblib_files:
-                    logging.info("Model or preprocessor files not found for second latest date.")
-                    continue
-                model_key = model_files[0]
-                joblib_key = joblib_files[0]
-                obj = s3.get_object(Bucket=s3_bucket, Key=joblib_key)
-                with io.BytesIO(obj['Body'].read()) as buffer:
-                    preprocessors = joblib.load(buffer)
-                scaler = preprocessors['scaler']
-                encoders = preprocessors['encoders']
-                obj = s3.get_object(Bucket=s3_bucket, Key=model_key)
-                with io.BytesIO(obj['Body'].read()) as buffer:
-                    state_dict = torch.load(buffer, map_location=torch.device('cpu'))
-                filename = os.path.basename(model_key)
-                sequence_length, _, hidden_size, num_layers, _, _, _ = parse_hyperparams(filename)
-                if filter_mode == 'new':
-                    df['is_new'] = df.set_index(key_columns).index.isin(new_keys)
-                df, numerical_cols, categorical_cols, untransformed_df = preprocess_df(df, encoders, scaler)
-                vocab_sizes = {col: len(encoders[col].classes_) + 1 for col in categorical_cols}
-                embed_dim = 16
-                input_size_num = len(numerical_cols)
-                model = LSTMModel(input_size_num, categorical_cols, vocab_sizes, embed_dim, hidden_size, num_layers)
-                for name, param in state_dict.items():
-                    if 'embeddings' in name and 'weight' in name:
-                        model_param = model.state_dict()[name]
-                        if model_param.shape[0] > param.shape[0] and model_param.shape[1:] == param.shape[1:]:
-                            model_param[:param.shape[0]].copy_(param)
-                            model_param[param.shape[0]:] = model_param[:param.shape[0]].mean(dim=0)
-                        elif model_param.shape == param.shape:
-                            model_param.copy_(param)
-                        else:
-                            raise ValueError(f"Shape mismatch for {name}")
+
+    df = None  # Load df outside loop for backfill
+    obj = s3.get_object(Bucket=s3_bucket, Key=s3_key_new)
+    df = pd.read_csv(obj['Body'], encoding='latin1')
+    df["Date"] = pd.to_datetime(df["Date"], format="%Y-%m-%d")
+    if df.empty:
+        logging.info("bet_data_new.csv is empty. Exiting.")
+        exit()
+
+    df['Account'] = df['Account'].astype(str).str.strip()
+    df['Bet Number'] = pd.to_numeric(df['Bet Number'].astype(str).str.replace(',', ''), errors='coerce')
+
+    if backfill_mode:  ### backfill mode
+        current_date = start_date
+        while current_date <= end_date:
+            most_recent_bet_date = current_date
+            most_recent_bet_date_str = most_recent_bet_date.strftime('%Y%m%d')
+            model_date = most_recent_bet_date - timedelta(days=1)
+            most_recent_model_date_str = model_date.strftime('%Y%m%d')
+            # Find model and preprocessors for model_date
+            files = []
+            continuation_token = None
+            while True:
+                kwargs = {'Bucket': s3_bucket, 'Prefix': 'models/'}
+                if continuation_token:
+                    kwargs['ContinuationToken'] = continuation_token
+                response = s3.list_objects_v2(**kwargs)
+                files.extend([obj['Key'] for obj in response.get('Contents', []) if 'end_' in obj['Key']])
+                if 'NextContinuationToken' not in response:
+                    break
+                continuation_token = response['NextContinuationToken']
+
+            model_files = [f for f in files if f'fade_model' in f and f'end_{most_recent_model_date_str}.pth' in f]
+            joblib_files = [f for f in files if
+                            'preprocessors' in f and f'end_{most_recent_model_date_str}.joblib' in f]
+            if not model_files or not joblib_files:
+                logging.info(f"Model or preprocessor files not found for date {most_recent_model_date_str}. Skipping.")
+                current_date += timedelta(days=1)
+                continue
+
+            model_key = model_files[0]
+            joblib_key = joblib_files[0]
+
+            obj = s3.get_object(Bucket=s3_bucket, Key=joblib_key)
+            with io.BytesIO(obj['Body'].read()) as buffer:
+                preprocessors = joblib.load(buffer)
+            scaler = preprocessors['scaler']
+            encoders = preprocessors['encoders']
+
+            obj = s3.get_object(Bucket=s3_bucket, Key=model_key)
+            with io.BytesIO(obj['Body'].read()) as buffer:
+                state_dict = torch.load(buffer, map_location=torch.device('cpu'))
+
+            filename = os.path.basename(model_key)
+            sequence_length, _, hidden_size, num_layers, _, _, _ = parse_hyperparams(filename)
+
+            df_up_to = df[df['Date'] <= most_recent_bet_date].copy()
+            if df_up_to.empty:
+                logging.info(f"No data up to {most_recent_bet_date_str}. Skipping.")
+                current_date += timedelta(days=1)
+                continue
+            df_date, numerical_cols, categorical_cols, untransformed_df = preprocess_df(df_up_to, encoders, scaler)
+
+            vocab_sizes = {col: len(encoders[col].classes_) + 1 for col in categorical_cols}
+            embed_dim = 16
+            input_size_num = len(numerical_cols)
+            model = LSTMModel(input_size_num, categorical_cols, vocab_sizes, embed_dim, hidden_size, num_layers)
+            for name, param in state_dict.items():
+                if 'embeddings' in name and 'weight' in name:
+                    model_param = model.state_dict()[name]
+                    if model_param.shape[0] > param.shape[0] and model_param.shape[1:] == param.shape[1:]:
+                        model_param[:param.shape[0]].copy_(param)
+                        model_param[param.shape[0]:] = model_param[:param.shape[0]].mean(dim=0)
+                    elif model_param.shape == param.shape:
+                        model_param.copy_(param)
                     else:
-                        model.state_dict()[name].copy_(param)
-                model.eval()
-                predictions = []
-                groups = df.groupby('Account')
-                for name, group in groups:
-                    group = group.sort_values('Date').reset_index()
-                    if filter_mode == 'new':
-                        infer_rows = group[group['is_new']]
-                    else:
-                        infer_rows = group[group['Date'] == most_recent_bet_date]
-                    for _, row in infer_rows.iterrows():
-                        m = row.name
-                        if m < sequence_length:
-                            continue
-                        seq_num = group.iloc[m - sequence_length:m][numerical_cols].values
-                        seq_cat = group.iloc[m - sequence_length:m][categorical_cols].values
-                        seq_num_t = torch.tensor(seq_num).float().unsqueeze(0)
-                        seq_cat_t = torch.tensor(seq_cat).long().unsqueeze(0)
-                        with torch.no_grad():
-                            logit = model(seq_num_t, seq_cat_t).squeeze()
-                            prob = torch.sigmoid(logit).item()
-                            prob = round(prob, 3)
-                        predictions.append(
-                            {'Account': name, 'Prob_W': prob, **untransformed_df.loc[row['index']].to_dict()})
-                pred_raw_df = pd.DataFrame(predictions)
-                pred_raw_df["Date"] = pd.to_datetime(pred_raw_df["Date"]).dt.strftime("%Y-%m-%d")
-                if filter_mode == 'new':
-                    pred_raw_key = f'predictions/pred_raw_{most_recent_bet_date_str}.csv'
-                    try:
-                        obj = s3.get_object(Bucket=s3_bucket, Key=pred_raw_key)
-                        existing_pred_raw_df = pd.read_csv(obj['Body'])
-                        pred_raw_df = pd.concat([existing_pred_raw_df, pred_raw_df], ignore_index=True)
-                        pred_raw_df = pred_raw_df.drop_duplicates(subset=[col for col in pred_raw_df.columns if col != "Prob_W"])
-                        if len(pred_raw_df) == len(existing_pred_raw_df):
-                            logging.info(f"All new predictions already exist at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}. Skipping.")
-                            previous_last_modified = current_last_modified
-                            raise Exception("No new predictions")
-                    except ClientError as e:
-                        if e.response['Error']['Code'] != 'NoSuchKey':
-                            raise
-                columns = ['Date', 'Account', 'Prob_W'] + [col for col in pred_raw_df.columns if
-                                                           col not in ['Date', 'Account', 'Prob_W']]
-                pred_raw_df = pred_raw_df[columns]
-                pred_raw_df = pred_raw_df.sort_values('Prob_W', ascending=True)
-                csv_buffer = io.StringIO()
-                pred_raw_df.to_csv(csv_buffer, index=False)
-                s3.put_object(Bucket=s3_bucket, Key=f'predictions/pred_raw_{most_recent_bet_date_str}.csv',
-                              Body=csv_buffer.getvalue())
-                pred_df_columns = ['Date', 'Account', 'Prob_W', 'Team',
-                                   'Sport', 'League',
-                                   'Unit Size', 'Wager',
-                                   'Odds', 'Type',
-                                   'Spread', 'Spread Type',
-                                   'Total', 'Total Type']
-                pred_df = pred_raw_df[pred_df_columns]
-                csv_buffer = io.StringIO()
-                pred_df.to_csv(csv_buffer, index=False)
-                s3.put_object(Bucket=s3_bucket, Key=f'predictions/pred_{most_recent_bet_date_str}.csv',
-                              Body=csv_buffer.getvalue())
-                csv_buffer.seek(0)
-                url = f"https://api.telegram.org/bot{telegram_bot_token}/sendDocument"
-                files = {'document': (f'pred_{most_recent_bet_date_str}.csv', csv_buffer.getvalue().encode('utf-8'))}
-                data = {'chat_id': telegram_chat_id, 'caption': 'Predicted bets'}
-                response = requests.post(url, data=data, files=files)
-                if response.status_code != 200:
-                    logging.info(f"Failed to send Telegram message: {response.text}")
+                        raise ValueError(f"Shape mismatch for {name}")
                 else:
+                    model.state_dict()[name].copy_(param)
+            model.eval()
+
+            predictions = []
+            groups = df_date.groupby('Account')
+            for name, group in groups:
+                group = group.sort_values('Date').reset_index()
+                infer_rows = group[group['Date'] == most_recent_bet_date]  # All rows for this date
+                for _, row in infer_rows.iterrows():
+                    m = row.name
+                    if m < sequence_length:
+                        continue
+                    seq_num = group.iloc[m - sequence_length:m][numerical_cols].values
+                    seq_cat = group.iloc[m - sequence_length:m][categorical_cols].values
+                    seq_num_t = torch.tensor(seq_num).float().unsqueeze(0)
+                    seq_cat_t = torch.tensor(seq_cat).long().unsqueeze(0)
+                    with torch.no_grad():
+                        logit = model(seq_num_t, seq_cat_t).squeeze()
+                        prob = torch.sigmoid(logit).item()
+                        prob = round(prob, 3)
+                    predictions.append(
+                        {'Account': name, 'Prob_W': prob, **untransformed_df.loc[row['index']].to_dict()})
+
+            if not predictions:
+                logging.info(f"No predictions for {most_recent_bet_date_str}. Skipping.")
+                current_date += timedelta(days=1)
+                continue
+
+            pred_raw_df = pd.DataFrame(predictions)
+            pred_raw_df["Date"] = pd.to_datetime(pred_raw_df["Date"]).dt.strftime("%Y-%m-%d")
+
+            # Check if already exists
+            pred_raw_key = f'predictions/pred_raw_{most_recent_bet_date_str}.csv'
+            try:
+                obj = s3.get_object(Bucket=s3_bucket, Key=pred_raw_key)
+                existing_pred_raw_df = pd.read_csv(obj['Body'])
+                pred_raw_df = pd.concat([existing_pred_raw_df, pred_raw_df], ignore_index=True)
+                pred_raw_df = pred_raw_df.drop_duplicates(
+                    subset=[col for col in pred_raw_df.columns if col != "Prob_W"])
+                if len(pred_raw_df) == len(existing_pred_raw_df):
+                    logging.info(f"Predictions already exist for {most_recent_bet_date_str}. Skipping.")
+                    current_date += timedelta(days=1)
+                    continue
+            except ClientError as e:
+                if e.response['Error']['Code'] != 'NoSuchKey':
+                    raise
+
+            columns = ['Date', 'Account', 'Prob_W'] + [col for col in pred_raw_df.columns if
+                                                       col not in ['Date', 'Account', 'Prob_W']]
+            pred_raw_df = pred_raw_df[columns]
+            pred_raw_df = pred_raw_df.sort_values('Prob_W', ascending=True)
+            csv_buffer = io.StringIO()
+            pred_raw_df.to_csv(csv_buffer, index=False)
+            s3.put_object(Bucket=s3_bucket, Key=pred_raw_key, Body=csv_buffer.getvalue())
+
+            pred_df_columns = ['Date', 'Account', 'Prob_W', 'Team',
+                               'Sport', 'League',
+                               'Unit Size', 'Wager',
+                               'Odds', 'Type',
+                               'Spread', 'Spread Type',
+                               'Total', 'Total Type']
+            pred_df = pred_raw_df[pred_df_columns]
+            csv_buffer = io.StringIO()
+            pred_df.to_csv(csv_buffer, index=False)
+            s3.put_object(Bucket=s3_bucket, Key=f'predictions/pred_{most_recent_bet_date_str}.csv',
+                          Body=csv_buffer.getvalue())
+
+            logging.info(f"Predictions saved for {most_recent_bet_date_str}.")
+            current_date += timedelta(days=1)
+    else:  #### non-backfill mode
+        previous_last_modified = None
+        previous_df = None
+        while True:
+            try:
+                head = s3.head_object(Bucket=s3_bucket, Key=s3_key_new)
+                current_last_modified = head['LastModified']
+                current_last_modified_str = pd.to_datetime(current_last_modified).tz_convert('US/Eastern').strftime(
+                    '%Y-%m-%d %H:%M:%S')
+                if previous_last_modified is None or current_last_modified > previous_last_modified:
+                    logging.info(f"File updated at {current_last_modified_str}. Checking for new rows.")
+                    obj = s3.get_object(Bucket=s3_bucket, Key=s3_key_new)
+                    df = pd.read_csv(obj['Body'], encoding='latin1')
+                    df["Date"] = pd.to_datetime(df["Date"], format="%Y-%m-%d")
+                    if df.empty:
+                        logging.info("bet_data_new.csv is empty. Skipping predictions.")
+                        previous_last_modified = current_last_modified
+                        continue
+                    df['Account'] = df['Account'].astype(str).str.strip()
+                    df['Bet Number'] = pd.to_numeric(df['Bet Number'].astype(str).str.replace(',', ''), errors='coerce')
+                    should_run = True
+                    if filter_mode == 'new':
+                        try:
+                            obj_old = s3.get_object(Bucket=s3_bucket, Key=s3_key_old)
+                            df_old = pd.read_csv(obj_old['Body'], encoding='latin1')
+                            df_old["Date"] = pd.to_datetime(df_old["Date"], format="%Y-%m-%d")
+                            df_old['Account'] = df_old['Account'].astype(str).str.strip()
+                            df_old['Bet Number'] = pd.to_numeric(df_old['Bet Number'].astype(str).str.replace(',', ''),
+                                                                 errors='coerce')
+                        except ClientError as e:
+                            if e.response['Error']['Code'] == 'NoSuchKey':
+                                df_old = pd.DataFrame(columns=df.columns)
+                            else:
+                                raise
+                        key_columns = ['Account', 'Bet Number']
+                        df_indexed = df.set_index(key_columns)
+                        df_old_indexed = df_old.set_index(key_columns)
+                        new_keys = df_indexed.index.difference(df_old_indexed.index)
+                        if new_keys.empty:
+                            logging.info(f"No new rows detected via comparison. Skipping predictions at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                            previous_last_modified = current_last_modified
+                            should_run = False
+                            continue
+                        logging.info(f"{len(new_keys)} new rows detected via comparison. Running predictions at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                        most_recent_bet_date = df_indexed.loc[new_keys, 'Date'].max()
+                    else:  # 'date'
+                        logging.info("Running predictions for most recent date.")
+                        most_recent_bet_date = df['Date'].max()
+                    most_recent_bet_date_str = most_recent_bet_date.strftime('%Y%m%d')
+                    if not should_run:
+                        continue
+                    files = []
+                    continuation_token = None
+                    while True:
+                        kwargs = {'Bucket': s3_bucket, 'Prefix': 'models/'}
+                        if continuation_token:
+                            kwargs['ContinuationToken'] = continuation_token
+                        response = s3.list_objects_v2(**kwargs)
+                        files.extend([obj['Key'] for obj in response.get('Contents', []) if 'end_' in obj['Key']])
+                        if 'NextContinuationToken' not in response:
+                            break
+                        continuation_token = response['NextContinuationToken']
+                    dates = set()
+                    for f in files:
+                        match = re.search(r'end_(\d{8})\.', f)
+                        if match:
+                            dates.add(match.group(1))
+                    sorted_dates = sorted(dates, reverse=True)
+                    if len(sorted_dates) < 2:
+                        logging.info("Insufficient models available.")
+                        continue
+                    most_recent_model_date_str = sorted_dates[0]
+                    model_files = [f for f in files if f'fade_model' in f and f'end_{most_recent_model_date_str}.pth' in f]
+                    joblib_files = [f for f in files if 'preprocessors' in f and f'end_{most_recent_model_date_str}.joblib' in f]
+                    if not model_files or not joblib_files:
+                        logging.info("Model or preprocessor files not found for second latest date.")
+                        continue
+                    model_key = model_files[0]
+                    joblib_key = joblib_files[0]
+                    obj = s3.get_object(Bucket=s3_bucket, Key=joblib_key)
+                    with io.BytesIO(obj['Body'].read()) as buffer:
+                        preprocessors = joblib.load(buffer)
+                    scaler = preprocessors['scaler']
+                    encoders = preprocessors['encoders']
+                    obj = s3.get_object(Bucket=s3_bucket, Key=model_key)
+                    with io.BytesIO(obj['Body'].read()) as buffer:
+                        state_dict = torch.load(buffer, map_location=torch.device('cpu'))
+                    filename = os.path.basename(model_key)
+                    sequence_length, _, hidden_size, num_layers, _, _, _ = parse_hyperparams(filename)
+                    if filter_mode == 'new':
+                        df['is_new'] = df.set_index(key_columns).index.isin(new_keys)
+                    df, numerical_cols, categorical_cols, untransformed_df = preprocess_df(df, encoders, scaler)
+                    vocab_sizes = {col: len(encoders[col].classes_) + 1 for col in categorical_cols}
+                    embed_dim = 16
+                    input_size_num = len(numerical_cols)
+                    model = LSTMModel(input_size_num, categorical_cols, vocab_sizes, embed_dim, hidden_size, num_layers)
+                    for name, param in state_dict.items():
+                        if 'embeddings' in name and 'weight' in name:
+                            model_param = model.state_dict()[name]
+                            if model_param.shape[0] > param.shape[0] and model_param.shape[1:] == param.shape[1:]:
+                                model_param[:param.shape[0]].copy_(param)
+                                model_param[param.shape[0]:] = model_param[:param.shape[0]].mean(dim=0)
+                            elif model_param.shape == param.shape:
+                                model_param.copy_(param)
+                            else:
+                                raise ValueError(f"Shape mismatch for {name}")
+                        else:
+                            model.state_dict()[name].copy_(param)
+                    model.eval()
+                    predictions = []
+                    groups = df.groupby('Account')
+                    for name, group in groups:
+                        group = group.sort_values('Date').reset_index()
+                        if filter_mode == 'new':
+                            infer_rows = group[group['is_new']]
+                        else:
+                            infer_rows = group[group['Date'] == most_recent_bet_date]
+                        for _, row in infer_rows.iterrows():
+                            m = row.name
+                            if m < sequence_length:
+                                continue
+                            seq_num = group.iloc[m - sequence_length:m][numerical_cols].values
+                            seq_cat = group.iloc[m - sequence_length:m][categorical_cols].values
+                            seq_num_t = torch.tensor(seq_num).float().unsqueeze(0)
+                            seq_cat_t = torch.tensor(seq_cat).long().unsqueeze(0)
+                            with torch.no_grad():
+                                logit = model(seq_num_t, seq_cat_t).squeeze()
+                                prob = torch.sigmoid(logit).item()
+                                prob = round(prob, 3)
+                            predictions.append(
+                                {'Account': name, 'Prob_W': prob, **untransformed_df.loc[row['index']].to_dict()})
+                    pred_raw_df = pd.DataFrame(predictions)
+                    pred_raw_df["Date"] = pd.to_datetime(pred_raw_df["Date"]).dt.strftime("%Y-%m-%d")
+                    if filter_mode == 'new':
+                        pred_raw_key = f'predictions/pred_raw_{most_recent_bet_date_str}.csv'
+                        try:
+                            obj = s3.get_object(Bucket=s3_bucket, Key=pred_raw_key)
+                            existing_pred_raw_df = pd.read_csv(obj['Body'])
+                            pred_raw_df = pd.concat([existing_pred_raw_df, pred_raw_df], ignore_index=True)
+                            pred_raw_df = pred_raw_df.drop_duplicates(subset=[col for col in pred_raw_df.columns if col != "Prob_W"])
+                            if len(pred_raw_df) == len(existing_pred_raw_df):
+                                logging.info(f"All new predictions already exist at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}. Skipping.")
+                                previous_last_modified = current_last_modified
+                                raise Exception("No new predictions")
+                        except ClientError as e:
+                            if e.response['Error']['Code'] != 'NoSuchKey':
+                                raise
+                    columns = ['Date', 'Account', 'Prob_W'] + [col for col in pred_raw_df.columns if
+                                                               col not in ['Date', 'Account', 'Prob_W']]
+                    pred_raw_df = pred_raw_df[columns]
+                    pred_raw_df = pred_raw_df.sort_values('Prob_W', ascending=True)
+                    csv_buffer = io.StringIO()
+                    pred_raw_df.to_csv(csv_buffer, index=False)
+                    s3.put_object(Bucket=s3_bucket, Key=f'predictions/pred_raw_{most_recent_bet_date_str}.csv',
+                                  Body=csv_buffer.getvalue())
+                    pred_df_columns = ['Date', 'Account', 'Prob_W', 'Team',
+                                       'Sport', 'League',
+                                       'Unit Size', 'Wager',
+                                       'Odds', 'Type',
+                                       'Spread', 'Spread Type',
+                                       'Total', 'Total Type']
+                    pred_df = pred_raw_df[pred_df_columns]
+                    csv_buffer = io.StringIO()
+                    pred_df.to_csv(csv_buffer, index=False)
+                    s3.put_object(Bucket=s3_bucket, Key=f'predictions/pred_{most_recent_bet_date_str}.csv',
+                                  Body=csv_buffer.getvalue())
+                    if not backfill_mode:
+                        csv_buffer.seek(0)
+                        url = f"https://api.telegram.org/bot{telegram_bot_token}/sendDocument"
+                        files = {'document': (f'pred_{most_recent_bet_date_str}.csv', csv_buffer.getvalue().encode('utf-8'))}
+                        data = {'chat_id': telegram_chat_id, 'caption': 'Predicted bets'}
+                        response = requests.post(url, data=data, files=files)
+                        if response.status_code != 200:
+                            logging.info(f"Failed to send Telegram message: {response.text}")
+                        else:
+                            time.sleep(600)
+                else:
+                    logging.info(f"No new rows detected. Skipping predictions at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                previous_last_modified = current_last_modified
+            except ClientError as e:
+                if e.response['Error']['Code'] == 'NoSuchKey':
+                    logging.info("bet_data_new.csv does not exist. Sleeping.")
                     time.sleep(600)
-            else:
-                logging.info(f"No new rows detected. Skipping predictions at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            previous_last_modified = current_last_modified
-        except ClientError as e:
-            if e.response['Error']['Code'] == 'NoSuchKey':
-                logging.info("bet_data_new.csv does not exist. Sleeping.")
-                time.sleep(600)
-            else:
+                else:
+                    logging.info(f"Error: {e}")
+                    time.sleep(600)
+            except Exception as e:
                 logging.info(f"Error: {e}")
                 time.sleep(600)
-        except Exception as e:
-            logging.info(f"Error: {e}")
-            time.sleep(600)
+        ##### end of non-backfill mode
