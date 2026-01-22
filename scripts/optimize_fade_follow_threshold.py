@@ -23,7 +23,7 @@ if __name__ == "__main__":
                         )
     parser.add_argument('--start_date',
                         type=str,
-                        default="2025-12-15",
+                        default="2025-05-01",
                         help='Start date for analysis (YYYY-MM-DD)'
                         )
     args = parser.parse_args()
@@ -127,7 +127,7 @@ if __name__ == "__main__":
             continue
         num_bets = len(strategy_df)
         if mode == 'fade':
-            profit_arr = np.where(strategy_df['Win'] == 0, strategy_df['Decimal Odds'] - 1, -1)
+            profit_arr = np.where(strategy_df['Win'] == 0, 1 / (strategy_df['Decimal Odds'] - 1), -1)
         else:  # follow
             profit_arr = np.where(strategy_df['Win'] == 1, strategy_df['Decimal Odds'] - 1, -1)
         total_profit = profit_arr.sum()
@@ -138,10 +138,10 @@ if __name__ == "__main__":
         print(
             f"{strategy_name} Threshold {x * 100:.0f}%: Profit: {total_profit:.2f}, ROI: {roi:.2f}, Num Bets: {num_bets}, $pnl: {pnl:.2f}")
         results.append({'threshold': x * 100, 'pnl': pnl, 'num_bets': num_bets})
-        if total_profit > opt_profit:
+        if roi > opt_roi:
+            opt_roi = roi
             opt_profit = total_profit
             opt_x = x
-            opt_roi = roi
             opt_num_bets = num_bets
             opt_pnl = pnl
     print(
@@ -154,6 +154,9 @@ if __name__ == "__main__":
     fig.add_trace(go.Scatter(x=df_plot['threshold'], y=df_plot['pnl'], mode='lines+markers', name='$pnl', yaxis='y'))
     fig.add_trace(
         go.Scatter(x=df_plot['threshold'], y=df_plot['num_bets'], mode='lines+markers', name='Num Bets', yaxis='y2'))
+    fig.add_trace(go.Scatter(x=[opt_x * 100], y=[opt_pnl], mode='markers',
+                             marker=dict(symbol='star', size=15, color='red'),
+                             name='Optimal ROI'))
     fig.update_layout(
         title=f'{strategy_name} Threshold Analysis {start_date} to {end_date}',
         xaxis_title='Threshold %',
